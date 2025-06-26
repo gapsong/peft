@@ -150,7 +150,8 @@ class QALoraLinearVariant(LoraVariant):
 
         if module.in_features is not None and module.in_features % kwargs["qalora_group_size"] != 0:
             raise ValueError(
-                f"`use_qalora=True` requires `module.in_features` ({module.in_features}) to be divisible by 'qalora_group_size' ({kwargs['qalora_group_size']})"
+                f"`use_qalora=True` requires `module.in_features` ({module.in_features}) to be"
+                f"divisible by 'qalora_group_size' ({kwargs['qalora_group_size']})"
             )
         qalora_group_size = kwargs["qalora_group_size"]
 
@@ -184,8 +185,101 @@ class QALoraLinearVariant(LoraVariant):
         raise NotImplementedError("QALoRA for GPTQ layers does not support 'safe_merge'.")
 
     @staticmethod
-    def merge_unsafe(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> None:
-        raise NotImplementedError("QALoRA for GPTQ layers does not support 'merge_unsafe'.")
+    def merge_unsafe(module: Linear, active_adapter: str, orig_weight: torch.Tensor, **kwargs) -> None:
+        """
+        Merge LoRA adapters directly into GPTQ quantization parameters (qzeros) in-place.
+        This method is an adaptation of the logic from the standalone merge script.
+
+        Args:
+            module (Linear): The quantized linear layer to be merged.
+            active_adapter (str): The name of the adapter to merge.
+            orig_weight (torch.Tensor): The original qweight tensor (unused in this logic).
+            **kwargs: Additional keyword arguments for merging.
+                - group_size (int): The GPTQ group size. Must be provided.
+                - amplification_factor (float): Factor to amplify scale. Default: 4.0.
+                - remove_group_size_division (bool): If True, don't divide by group_size. Default: False.
+        """
+        if hasattr(module, "base_layer") and (
+            not hasattr(module.base_layer, "qzeros") or not hasattr(module.base_layer, "scales")
+        ):
+            # This variant is only applicable to GPTQ layers with qzeros and scales
+            return
+
+        lora_A = module.lora_A[active_adapter]
+        lora_B = module.lora_B[active_adapter]
+        lora_r = module.r[active_adapter]
+        lora_alpha = module.lora_alpha[active_adapter]
+
+        # Get merge parameters from kwargs, with defaults from the script
+        amplification_factor = kwargs.get("amplification_factor", 20.0)
+        remove_group_size_division = kwargs.get("remove_group_size_division", False)
+        group_size = kwargs.get("group_size", 32)
+
+        if group_size is None:
+            raise ValueError("`group_size` must be provided in the merge call for GPTQMergeLinearVariant.")
+
+        # Calculate scale
+        scale = (lora_alpha / lora_r) * amplification_factor
+        lora_contribution = (lora_B.weight @ lora_A.weight).t()
+
+        with torch.no_grad():
+            bits = getattr(module, "bits", 4)
+            mask = (2**bits) - 1
+
+            if module.base_layer.scales.shape[0] == 0:
+                return
+            rows_per_group = lora_contribution.shape[0] // module.base_layer.scales.shape[0]
+            expanded_scales = torch.repeat_interleave(module.base_layer.scales, rows_per_group, dim=0)
+
+            if expanded_scales.shape != lora_contribution.shape:
+                if (
+                    expanded_scales.shape[0] == lora_contribution.shape[0]
+                    and lora_contribution.shape[1] % expanded_scales.shape[1] == 0
+                ):
+                    factor = lora_contribution.shape[1] // expanded_scales.shape[1]
+                    expanded_scales = torch.repeat_interleave(expanded_scales, factor, dim=1)
+                else:
+                    return
+
+            if remove_group_size_division:
+                raw_adjustment = lora_contribution * scale / expanded_scales
+            else:
+                raw_adjustment = lora_contribution * scale / group_size / expanded_scales
+
+            original_qzeros_packed = module.base_layer.qzeros
+            new_qzeros_packed = torch.zeros_like(original_qzeros_packed)
+
+            if module.base_layer.qzeros.dtype == torch.int32:
+                elements_per_packed_val = 32 // bits
+            elif module.base_layer.qzeros.dtype == torch.int8:
+                elements_per_packed_val = 8 // bits
+            else:
+                return
+
+            for i in range(elements_per_packed_val):
+                shift = i * bits
+                unpacked_zeros_this_segment = (original_qzeros_packed >> shift) & mask
+                segment_int_adjustment = torch.zeros_like(
+                    unpacked_zeros_this_segment, dtype=original_qzeros_packed.dtype
+                )
+
+                for g_out in range(original_qzeros_packed.shape[0]):
+                    for g_in_packed in range(original_qzeros_packed.shape[1]):
+                        current_input_col_scalar_idx = g_in_packed * elements_per_packed_val + i
+                        if current_input_col_scalar_idx >= raw_adjustment.shape[1]:
+                            continue
+
+                        raw_adj_slice = raw_adjustment[
+                            g_out * rows_per_group : (g_out + 1) * rows_per_group, current_input_col_scalar_idx
+                        ]
+                        mean_float_adj = raw_adj_slice.mean()
+                        int_adj = mean_float_adj.round().to(original_qzeros_packed.dtype)
+                        segment_int_adjustment[g_out, g_in_packed] = int_adj
+
+                adjusted_segment_zeros = torch.clamp(unpacked_zeros_this_segment + segment_int_adjustment, 0, mask)
+                new_qzeros_packed = (new_qzeros_packed & ~(mask << shift)) | ((adjusted_segment_zeros & mask) << shift)
+
+            module.base_layer.qzeros.data = new_qzeros_packed
 
     @staticmethod
     def unmerge(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
