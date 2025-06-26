@@ -135,7 +135,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             )
 
         if getattr(model, "is_gradient_checkpointing", True):
-            model = self._prepare_model_for_gradient_checkpointing(model)
+            model = self.prepare_model_for_gradient_checkpointing(model)
 
         # the `pretraining_tp` is set for some models to simulate Tensor Parallelism during inference to avoid
         # numerical differences, https://github.com/pytorch/pytorch/issues/76232 - to avoid any unexpected
@@ -384,6 +384,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         autocast_adapter_dtype: bool = True,
         ephemeral_gpu_offload: bool = False,
         low_cpu_mem_usage: bool = False,
+        key_mapping: Optional[dict[str, str]] = None,
         **kwargs: Any,
     ) -> PeftModel:
         r"""
@@ -423,6 +424,10 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                 process.
             torch_device (`str`, *optional*, defaults to None):
                 The device to load the adapter on. If `None`, the device will be inferred.
+            key_mapping (dict, *optional*, defaults to None)
+                Extra mapping of PEFT `state_dict` keys applied before loading the `state_dict`. When this mapping is
+                applied, the PEFT-specific `"base_model.model"` prefix is removed beforehand and the adapter name (e.g.
+                `"default"`) is not inserted yet. Only pass this argument if you know what you're doing.
             kwargs: (`optional`):
                 Additional keyword arguments passed along to the specific PEFT configuration class.
         """
@@ -445,6 +450,19 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             config.inference_mode = not is_trainable
         else:
             raise ValueError(f"The input config must be a PeftConfig, got {config.__class__}")
+
+        # See discussion in https://github.com/huggingface/transformers/pull/38627
+        # Some transformers models can have a _checkpoint_conversion_mapping dict that is used to map state_dicts
+        # stemming from updated model architectures so that they still correspond to the initial architecture. When
+        # loading a PEFT state_dict created with the initial architecture on a model with the new architecture, we need
+        # to map it too according to the same rules. Note that we skip prompt learning methods. This is because they
+        # don't have the "base_model.model." prefix, which we need to remove before mapping. Instead just using
+        # "base_model.". This could be fine, we could only remove "base_model.", However, the subsequent sub-module
+        # could also be called "model", resulting in what looks like "base_model.model.". To avoid this confusion, we
+        # skip prompt learning. Since it applies itself directly to the pre-trained model (unlike LoRA et al that target
+        # sub-modules), skipping should be fine.
+        if (key_mapping is None) and (not config.is_prompt_learning):
+            key_mapping = getattr(model, "_checkpoint_conversion_mapping", {})
 
         # Runtime configuration, if supported
         if hasattr(config, "runtime_config"):
@@ -540,6 +558,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             is_trainable=is_trainable,
             autocast_adapter_dtype=autocast_adapter_dtype,
             low_cpu_mem_usage=low_cpu_mem_usage,
+            key_mapping=key_mapping,
             **kwargs,
         )
 
@@ -553,6 +572,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             # difficult for users to even notice that something might have gone wrong here. As we filter out non PEFT
             # keys from the missing keys, this gives no false positives.
 
+            # careful: if the wording of the warning is changed, adjust the unit tests accordingly!
             warn_message = f"Found missing adapter keys while loading the checkpoint: {missing_keys}."
 
             prefix = PEFT_TYPE_TO_PREFIX_MAPPING.get(config.peft_type)
@@ -606,7 +626,10 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                 deepspeed_distributed_tensor_shape = getattr(value, "ds_shape", None)
 
                 # Handle VLM case with separate text and vision configs
-                if "text_config" in self.base_model.config:
+                if hasattr(self.base_model.config, "get_text_config"):
+                    vocab_size = self.base_model.config.get_text_config().vocab_size
+                # below: for older transformers versions before get_text_config was added
+                elif "text_config" in self.base_model.config:
                     vocab_size = self.base_model.config.text_config.vocab_size
                 else:
                     vocab_size = self.base_model.config.vocab_size
@@ -639,10 +662,13 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             config.num_virtual_tokens * config.num_transformer_submodules
         ).long()
 
-    def _prepare_model_for_gradient_checkpointing(self, model: PreTrainedModel):
+    def prepare_model_for_gradient_checkpointing(self, model: PreTrainedModel):
         r"""
         Prepares the model for gradient checkpointing if necessary
         """
+        self._prepare_model_for_gradient_checkpointing(model)
+
+    def _prepare_model_for_gradient_checkpointing(self, model: PreTrainedModel):
         if not (
             getattr(model, "is_loaded_in_8bit", False)
             or getattr(model, "is_loaded_in_4bit", False)
@@ -1225,6 +1251,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         autocast_adapter_dtype: bool = True,
         ephemeral_gpu_offload: bool = False,
         low_cpu_mem_usage: bool = False,
+        key_mapping: Optional[dict[str, str]] = None,
         **kwargs: Any,
     ):
         """
@@ -1258,6 +1285,10 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             low_cpu_mem_usage (`bool`, `optional`, defaults to `False`):
                 Create empty adapter weights on meta device before loading the saved weights. Useful to speed up the
                 process.
+            key_mapping (dict, *optional*, defaults to None)
+                Extra mapping of PEFT `state_dict` keys applied before loading the `state_dict`. When this mapping is
+                applied, the PEFT-specific `"base_model.model"` prefix is removed beforehand and the adapter name (e.g.
+                `"default"`) is not inserted yet. Only pass this argument if you know what you're doing.
             kwargs: (`optional`):
                 Additional arguments to modify the way the adapter is loaded, e.g. the token for Hugging Face Hub.
         """
@@ -1283,7 +1314,9 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             peft_config.inference_mode = not is_trainable
             self.add_adapter(adapter_name, peft_config, low_cpu_mem_usage=low_cpu_mem_usage)
 
-        adapters_weights = load_peft_weights(model_id, device=torch_device, **hf_hub_download_kwargs)
+        adapters_weights = load_peft_weights(
+            model_id, device=torch_device, key_mapping=key_mapping, **hf_hub_download_kwargs
+        )
 
         # load the weights into the model
         ignore_mismatched_sizes = kwargs.get("ignore_mismatched_sizes", False)
@@ -1314,8 +1347,16 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         ):
             device_map = kwargs.get("device_map", "auto")
             max_memory = kwargs.get("max_memory", None)
-            offload_dir = kwargs.get("offload_folder", None)
+            offload_folder = kwargs.get("offload_folder", None)
+            offload_dir = kwargs.get("offload_dir", None)
             offload_index = kwargs.get("offload_index", None)
+
+            if offload_dir is not None and offload_folder is not None:
+                # see https://github.com/huggingface/peft/issues/2541
+                raise ValueError("Cannot use `offload_folder` when `offload_dir` is specified.")
+            elif offload_dir is None:
+                # to keep backwards compatibility
+                offload_dir = offload_folder
 
             dispatch_model_kwargs = {}
             # Safety checker for previous `accelerate` versions
