@@ -19,6 +19,7 @@ from peft.import_utils import is_gptqmodel_available
 from peft.tuners.lora.layer import LoraLayer
 from peft.tuners.tuners_utils import BaseTunerLayer
 from peft.utils import get_auto_gptq_quant_linear
+from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
 from .layer import LoraVariant
 
@@ -78,6 +79,52 @@ class GPTQLoraLinear(torch.nn.Module, LoraLayer):
         else:
             variant = None
         return variant
+
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+        """
+        Merge the active adapter weights into the base weights
+
+        Args:
+            safe_merge (`bool`, *optional*):
+                If True, the merge operation will be performed in a copy of the original weights and check for NaNs
+                before merging the weights. This is useful if you want to check if the merge operation will produce
+                NaNs. Defaults to `False`.
+            adapter_names (`list[str]`, *optional*):
+                The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
+                to `None`.
+        """
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            # no adapter to merge
+            return
+
+        for active_adapter in adapter_names:
+            if active_adapter in self.lora_A.keys():
+                base_layer = self.get_base_layer()
+                if safe_merge:
+                    # Note that safe_merge will be slower than the normal merge
+                    # because of the copy operation.
+                    orig_weight = base_layer.weight.data.clone()
+                    if active_adapter not in self.lora_variant:  # vanilla LoRA
+                        orig_dtype = base_layer.weight.dtype
+                        orig_weight += self.get_delta_weight(active_adapter).to(orig_dtype)
+                    else:
+                        orig_weight = self.lora_variant[active_adapter].merge_safe(self, active_adapter, orig_weight)
+
+                    if not torch.isfinite(orig_weight).all():
+                        raise ValueError(
+                            f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
+                        )
+
+                    base_layer.weight.data = orig_weight
+                else:
+                    if active_adapter not in self.lora_variant:  # vanilla LoRA
+                        orig_dtype = base_layer.weight.dtype
+                        base_layer.weight.data += self.get_delta_weight(active_adapter).to(orig_dtype)
+                    else:
+                        self.lora_variant[active_adapter].merge_unsafe(self, active_adapter, base_layer)
+                self.merged_adapters.append(active_adapter)
+
 
     def forward(self, x: torch.Tensor):
         # note: logic differs from default Linear because merging is not supported

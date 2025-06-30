@@ -130,195 +130,6 @@ class DoraLinearVariant(LoraVariant):
         return result
 
 
-class QALoraLinearVariant(LoraVariant):
-    @staticmethod
-    def init(module: Linear, adapter_name: str, **kwargs: Any) -> None:
-        """
-        Initializes QALoRA specific parameters for a given adapter.
-
-        Args:
-            module (Linear): The linear module to be adapted.
-            adapter_name (str): The name of the adapter.
-            **kwargs: Additional keyword arguments.
-                qalora_group_size (int): The size of groups for pooling. This is expected to be passed.
-        """
-        if "qalora_group_size" not in kwargs:
-            raise ValueError(
-                "`use_qalora=True` requires 'qalora_group_size' to be provided in kwargs."
-                " Please ensure it is passed from the LoraConfig."
-            )
-
-        if module.in_features is not None and module.in_features % kwargs["qalora_group_size"] != 0:
-            raise ValueError(
-                f"`use_qalora=True` requires `module.in_features` ({module.in_features}) to be"
-                f"divisible by 'qalora_group_size' ({kwargs['qalora_group_size']})"
-            )
-        qalora_group_size = kwargs["qalora_group_size"]
-
-        if "qalora_group_size" not in module.other_param_names:
-            module.other_param_names = module.other_param_names + ("qalora_group_size",)
-
-        if not hasattr(module, "qalora_group_size"):
-            module.qalora_group_size = {}
-        module.qalora_group_size[adapter_name] = qalora_group_size
-
-        old_lora_A_layer = module.lora_A[adapter_name]
-        r = old_lora_A_layer.out_features
-        device = old_lora_A_layer.weight.device
-        dtype = old_lora_A_layer.weight.dtype
-
-        new_lora_A_layer = nn.Linear(
-            old_lora_A_layer.in_features // module.qalora_group_size[adapter_name],
-            r,
-            bias=False,
-            device=device,
-            dtype=dtype,
-        )
-        module.lora_A[adapter_name] = new_lora_A_layer
-
-    @staticmethod
-    def get_delta_weight(module: Linear, active_adapter: str) -> torch.Tensor:
-        raise NotImplementedError("QALoRA for GPTQ layers does not support 'get_delta_weight'.")
-
-    @staticmethod
-    def merge_safe(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("QALoRA for GPTQ layers does not support 'safe_merge'.")
-
-    @staticmethod
-    def merge_unsafe(module: Linear, active_adapter: str, orig_weight: torch.Tensor, **kwargs) -> None:
-        """
-        Merge LoRA adapters directly into GPTQ quantization parameters (qzeros) in-place.
-        This method is an adaptation of the logic from the standalone merge script.
-
-        Args:
-            module (Linear): The quantized linear layer to be merged.
-            active_adapter (str): The name of the adapter to merge.
-            orig_weight (torch.Tensor): The original qweight tensor (unused in this logic).
-            **kwargs: Additional keyword arguments for merging.
-                - group_size (int): The GPTQ group size. Must be provided.
-                - amplification_factor (float): Factor to amplify scale. Default: 4.0.
-                - remove_group_size_division (bool): If True, don't divide by group_size. Default: False.
-        """
-        if hasattr(module, "base_layer") and (
-            not hasattr(module.base_layer, "qzeros") or not hasattr(module.base_layer, "scales")
-        ):
-            # This variant is only applicable to GPTQ layers with qzeros and scales
-            return
-
-        lora_A = module.lora_A[active_adapter]
-        lora_B = module.lora_B[active_adapter]
-        lora_r = module.r[active_adapter]
-        lora_alpha = module.lora_alpha[active_adapter]
-
-        # Get merge parameters from kwargs, with defaults from the script
-        amplification_factor = kwargs.get("amplification_factor", 20.0)
-        remove_group_size_division = kwargs.get("remove_group_size_division", False)
-        group_size = kwargs.get("group_size", 32)
-
-        if group_size is None:
-            raise ValueError("`group_size` must be provided in the merge call for GPTQMergeLinearVariant.")
-
-        # Calculate scale
-        scale = (lora_alpha / lora_r) * amplification_factor
-        lora_contribution = (lora_B.weight @ lora_A.weight).t()
-
-        with torch.no_grad():
-            bits = getattr(module, "bits", 4)
-            mask = (2**bits) - 1
-
-            if module.base_layer.scales.shape[0] == 0:
-                return
-            rows_per_group = lora_contribution.shape[0] // module.base_layer.scales.shape[0]
-            expanded_scales = torch.repeat_interleave(module.base_layer.scales, rows_per_group, dim=0)
-
-            if expanded_scales.shape != lora_contribution.shape:
-                if (
-                    expanded_scales.shape[0] == lora_contribution.shape[0]
-                    and lora_contribution.shape[1] % expanded_scales.shape[1] == 0
-                ):
-                    factor = lora_contribution.shape[1] // expanded_scales.shape[1]
-                    expanded_scales = torch.repeat_interleave(expanded_scales, factor, dim=1)
-                else:
-                    return
-
-            if remove_group_size_division:
-                raw_adjustment = lora_contribution * scale / expanded_scales
-            else:
-                raw_adjustment = lora_contribution * scale / group_size / expanded_scales
-
-            original_qzeros_packed = module.base_layer.qzeros
-            new_qzeros_packed = torch.zeros_like(original_qzeros_packed)
-
-            if module.base_layer.qzeros.dtype == torch.int32:
-                elements_per_packed_val = 32 // bits
-            elif module.base_layer.qzeros.dtype == torch.int8:
-                elements_per_packed_val = 8 // bits
-            else:
-                return
-
-            for i in range(elements_per_packed_val):
-                shift = i * bits
-                unpacked_zeros_this_segment = (original_qzeros_packed >> shift) & mask
-                segment_int_adjustment = torch.zeros_like(
-                    unpacked_zeros_this_segment, dtype=original_qzeros_packed.dtype
-                )
-
-                for g_out in range(original_qzeros_packed.shape[0]):
-                    for g_in_packed in range(original_qzeros_packed.shape[1]):
-                        current_input_col_scalar_idx = g_in_packed * elements_per_packed_val + i
-                        if current_input_col_scalar_idx >= raw_adjustment.shape[1]:
-                            continue
-
-                        raw_adj_slice = raw_adjustment[
-                            g_out * rows_per_group : (g_out + 1) * rows_per_group, current_input_col_scalar_idx
-                        ]
-                        mean_float_adj = raw_adj_slice.mean()
-                        int_adj = mean_float_adj.round().to(original_qzeros_packed.dtype)
-                        segment_int_adjustment[g_out, g_in_packed] = int_adj
-
-                adjusted_segment_zeros = torch.clamp(unpacked_zeros_this_segment + segment_int_adjustment, 0, mask)
-                new_qzeros_packed = (new_qzeros_packed & ~(mask << shift)) | ((adjusted_segment_zeros & mask) << shift)
-
-            module.base_layer.qzeros.data = new_qzeros_packed
-
-    @staticmethod
-    def unmerge(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("QALoRA for GPTQ layers does not support 'unmerge'.")
-
-    @staticmethod
-    def forward(module: Linear, active_adapter: str, x: torch.Tensor, result: torch.Tensor) -> torch.Tensor:
-        lora_A_weight = module.lora_A[active_adapter].weight
-        lora_B_weight = module.lora_B[active_adapter].weight
-        dropout = module.lora_dropout[active_adapter]
-        scaling = module.scaling[active_adapter]
-        group_size = module.qalora_group_size[active_adapter]
-
-        x_dropped = dropout(x) if module.training and not isinstance(dropout, nn.Identity) else x
-        orig_shape = x_dropped.shape
-
-        # Reshape to 2D
-        if len(orig_shape) > 2:
-            x_flat = x_dropped.view(-1, module.in_features)
-        else:
-            x_flat = x_dropped
-
-        batch_size, in_features = x_flat.shape
-        pooled_features = in_features // group_size
-
-        x_pooled = x_flat.view(batch_size, pooled_features, group_size).mean(dim=2)
-
-        x_pooled_scaled = x_pooled * pooled_features
-
-        # LoRA computation
-        delta = x_pooled_scaled @ lora_A_weight.t() @ lora_B_weight.t() * scaling
-
-        # Reshape back
-        if len(orig_shape) > 2:
-            delta = delta.view(orig_shape[:-1] + (delta.size(-1),))
-
-        return result + delta
-
-
 class DoraEmbeddingVariant(DoraLinearVariant):
     @staticmethod
     def init(module: Embedding, adapter_name: str, **kwargs: Any) -> None:
@@ -504,3 +315,180 @@ class DoraConv3dVariant(_DoraConvNdVariant):
     def init(module: Conv3d, adapter_name: str, **kwargs: Any) -> None:
         dora_layer = DoraConv3dLayer(fan_in_fan_out=False)
         _DoraConvNdVariant.init_convd_variant(module, adapter_name, dora_layer=dora_layer)
+
+
+class QALoraLinearVariant(LoraVariant):
+    @staticmethod
+    def init(module: Linear, adapter_name: str, **kwargs: Any) -> None:
+        """
+        Initializes QALoRA specific parameters for a given adapter.
+
+        Args:
+            module (Linear): The linear module to be adapted.
+            adapter_name (str): The name of the adapter.
+            **kwargs: Additional keyword arguments.
+                qalora_group_size (int): The size of groups for pooling. This is expected to be passed.
+        """
+        if "qalora_group_size" not in kwargs:
+            raise ValueError(
+                "`use_qalora=True` requires 'qalora_group_size' to be provided in kwargs."
+                " Please ensure it is passed from the LoraConfig."
+            )
+
+        if module.in_features is not None and module.in_features % kwargs["qalora_group_size"] != 0:
+            raise ValueError(
+                f"`use_qalora=True` requires `module.in_features` ({module.in_features}) to be"
+                f"divisible by 'qalora_group_size' ({kwargs['qalora_group_size']})"
+            )
+        qalora_group_size = kwargs["qalora_group_size"]
+
+        if "qalora_group_size" not in module.other_param_names:
+            module.other_param_names = module.other_param_names + ("qalora_group_size",)
+
+        if not hasattr(module, "qalora_group_size"):
+            module.qalora_group_size = {}
+        module.qalora_group_size[adapter_name] = qalora_group_size
+
+        old_lora_A_layer = module.lora_A[adapter_name]
+        r = old_lora_A_layer.out_features
+        device = old_lora_A_layer.weight.device
+        dtype = old_lora_A_layer.weight.dtype
+
+        new_lora_A_layer = nn.Linear(
+            old_lora_A_layer.in_features // module.qalora_group_size[adapter_name],
+            r,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+        module.lora_A[adapter_name] = new_lora_A_layer
+
+    @staticmethod
+    def get_delta_weight(module: Linear, active_adapter: str) -> torch.Tensor:
+        raise NotImplementedError("QALoRA for GPTQ layers does not support 'get_delta_weight'.")
+
+    @staticmethod
+    def merge_safe(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("QALoRA for GPTQ layers does not support 'safe_merge'.")
+
+    @staticmethod
+    def merge_unsafe(module: Linear, active_adapter: str, orig_weight: torch.Tensor, **kwargs) -> None:
+        """
+        Merges the QALoRA adapter by first "un-pooling" the LoRA contribution to match
+        the original weight dimensions, and then merging this full-resolution adjustment
+        into the qzeros.
+
+        Args:
+            module (Linear): The quantized linear layer to be merged.
+            active_adapter (str): The name of the adapter to merge.
+            orig_weight (torch.Tensor): Unused in this variant.
+            **kwargs: Additional keyword arguments for merging.
+        """
+        if not (hasattr(module, "base_layer") and hasattr(module.base_layer, "qzeros") and hasattr(module.base_layer, "scales")):
+            return
+
+        # --- 1. Parameter sammeln ---
+        lora_A = module.lora_A[active_adapter]
+        lora_B = module.lora_B[active_adapter]
+        lora_r = module.r[active_adapter]
+        lora_alpha = module.lora_alpha[active_adapter]
+        scales = module.base_layer.scales
+        qzeros_packed = module.base_layer.qzeros
+
+        # Holen Sie die Gruppengrößen aus den Modul-Attributen
+        qalora_group_size = module.qalora_group_size[active_adapter]
+        gptq_group_size = module.base_layer.group_size
+
+        amplification_factor = kwargs.get("amplification_factor", 20.0)
+        effective_scale = (lora_alpha / lora_r) * amplification_factor
+
+        with torch.no_grad():
+            # --- 2. LoRA-Beitrag auf der gepoolten Ebene berechnen ---
+            # Dies ergibt eine "low-resolution" Delta-Matrix: delta_W_pooled
+            # Shape: [out_features, in_features / qalora_group_size]
+            delta_W_pooled = lora_B.weight @ lora_A.weight
+
+            # --- 3. "Un-Pooling": Den Beitrag auf die volle Dimension hochskalieren ---
+            # Wir wiederholen jede Spalte (die einem Pool entspricht) `qalora_group_size` mal,
+            # um die ursprüngliche `in_features`-Dimension wiederherzustellen.
+            # Shape: [out_features, in_features]
+            delta_W_full = delta_W_pooled.repeat_interleave(qalora_group_size, dim=1)
+
+            # --- 4. Den "Full-Resolution-Shift" für die qzeros berechnen ---
+            # Zuerst transponieren wir, um die Form an die `scales` anzupassen.
+            # Shape: [in_features, out_features]
+            lora_contribution_full = delta_W_full.t()
+
+            # Jetzt gruppieren wir diesen vollen Beitrag gemäß der GPTQ-Gruppengröße,
+            # indem wir den Mittelwert über jede Gruppe bilden.
+            # Shape: [in_features / gptq_group_size, out_features]
+            num_groups = scales.shape[0]
+            lora_contribution_grouped = lora_contribution_full.view(
+                num_groups, gptq_group_size, -1
+            ).mean(dim=1)
+
+            # --- 5. Finale Formel anwenden ---
+            # adjustment = grouped_lora_contribution * scale / scales
+            # Wir teilen hier NICHT durch die group_size, da wir bereits den Mittelwert gebildet haben.
+            float_adjustment = lora_contribution_grouped * effective_scale / scales
+
+            # --- 6. Originale qzeros entpacken ---
+            bits = getattr(module, "bits", 4)
+            mask = (2**bits) - 1
+            if qzeros_packed.dtype != torch.int32:
+                print("Warning: qzeros are not in packed int32 format. Skipping merge.")
+                return
+
+            elements_per_packed_val = 32 // bits
+            shifts = torch.arange(0, elements_per_packed_val * bits, bits, device=qzeros_packed.device, dtype=torch.int32).unsqueeze(0)
+            unpacked_qzeros = (qzeros_packed.unsqueeze(-1) >> shifts) & mask
+            unpacked_qzeros = unpacked_qzeros.view(qzeros_packed.shape[0], -1)
+            unpacked_qzeros = unpacked_qzeros[:, :scales.shape[1]]
+
+            # --- 7. Neue FP16 qzeros berechnen und ersetzen ---
+            new_qzeros_fp16 = unpacked_qzeros.to(torch.float16) - float_adjustment.to(torch.float16)
+
+            del module.base_layer.qzeros
+            module.base_layer.register_parameter(
+                "qzeros", torch.nn.Parameter(new_qzeros_fp16, requires_grad=False)
+            )
+            print(f"Merged adapter into qzeros for layer {module.adapter_layer_names[0]}.")
+
+
+
+    @staticmethod
+    def unmerge(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("QALoRA for GPTQ layers does not support 'unmerge'.")
+
+    @staticmethod
+    def forward(module: Linear, active_adapter: str, x: torch.Tensor, result: torch.Tensor) -> torch.Tensor:
+        lora_A_weight = module.lora_A[active_adapter].weight
+        lora_B_weight = module.lora_B[active_adapter].weight
+        dropout = module.lora_dropout[active_adapter]
+        scaling = module.scaling[active_adapter]
+        group_size = module.qalora_group_size[active_adapter]
+
+        x_dropped = dropout(x) if module.training and not isinstance(dropout, nn.Identity) else x
+        orig_shape = x_dropped.shape
+
+        # Reshape to 2D
+        if len(orig_shape) > 2:
+            x_flat = x_dropped.view(-1, module.in_features)
+        else:
+            x_flat = x_dropped
+
+        batch_size, in_features = x_flat.shape
+        pooled_features = in_features // group_size
+
+        x_pooled = x_flat.view(batch_size, pooled_features, group_size).mean(dim=2)
+
+        x_pooled_scaled = x_pooled * pooled_features
+
+        # LoRA computation
+        delta = x_pooled_scaled @ lora_A_weight.t() @ lora_B_weight.t() * scaling
+
+        # Reshape back
+        if len(orig_shape) > 2:
+            delta = delta.view(orig_shape[:-1] + (delta.size(-1),))
+
+        return result + delta

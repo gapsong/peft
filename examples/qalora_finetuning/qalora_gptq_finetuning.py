@@ -7,6 +7,8 @@ This script supports cached quantization to avoid repeating expensive quantizati
 import argparse
 import os
 
+from gptqmodel.utils import Perplexity
+
 import torch
 from datasets import load_dataset
 from transformers import (
@@ -205,6 +207,23 @@ def train_model(
 
     # Get PEFT model with adapters
     model = get_peft_model(model, lora_config)
+    merged_model = model.merge_and_unload()
+    merged_model.save_pretrained('qalora_output_merged_model_via_beta_shift')
+
+    print("\nCalculating initial perplexity on the test set...")
+    # Instantiate the Perplexity evaluator with parameters from the training arguments
+    ppl_evaluator = Perplexity(
+        model=model,
+        tokenizer=tokenizer,
+        dataset_path=data_path,
+        dataset_name=data_split if data_split else None,  # Pass None if the split string is empty
+        split="test",  # Evaluate on the test split
+        text_column="text",  # Standard text column name
+    )
+    # Calculate perplexity using the sequence length and batch size from training arguments
+    perplexity_scores = ppl_evaluator.calculate(n_ctx=cutoff_len, n_batch=batch_size)
+    if perplexity_scores:
+        print(f"Initial perplexity calculated. Final score: {perplexity_scores[-1]:.4f}")
 
     model.print_trainable_parameters()
 
@@ -279,6 +298,9 @@ def train_model(
     print(f"\nTraining complete. Model saved to {output_dir}")
 
 
+    return model, tokenizer
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fine-tune LLMs with QALoRA and GPTQ quantization")
 
@@ -324,7 +346,7 @@ if __name__ == "__main__":
     if not args.use_qalora:
         args.use_qalora = True  # Default to True as in the original code
 
-    train_model(
+    my_model, my_tokenizer = train_model(
         base_model=args.base_model,
         data_path=args.data_path,
         data_split=args.data_split,
@@ -345,3 +367,18 @@ if __name__ == "__main__":
         qalora_group_size=args.qalora_group_size,
         bits=args.bits,
     )
+
+    print("\nCalculating initial perplexity on the test set...")
+    # Instantiate the Perplexity evaluator with parameters from the training arguments
+    ppl_evaluator = Perplexity(
+        model=my_model,
+        tokenizer=my_tokenizer,
+        dataset_path=args.data_path,
+        dataset_name=args.data_split if args.data_split else None,  # Pass None if the split string is empty
+        split="test",  # Evaluate on the test split
+        text_column="text",  # Standard text column name
+    )
+    # Calculate perplexity using the sequence length and batch size from training arguments
+    perplexity_scores = ppl_evaluator.calculate(n_ctx=args.cutoff_len, n_batch=args.batch_size)
+    if perplexity_scores:
+        print(f"Initial perplexity calculated. Final score: {perplexity_scores[-1]:.4f}")
