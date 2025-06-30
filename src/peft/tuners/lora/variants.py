@@ -383,8 +383,13 @@ class QALoraLinearVariant(LoraVariant):
             active_adapter (str): The name of the adapter to merge.
             orig_weight (torch.Tensor): Unused in this variant.
             **kwargs: Additional keyword arguments for merging.
+                - amplification_factor (float): Factor to amplify scale. Default: 4.0.
         """
-        if not (hasattr(module, "base_layer") and hasattr(module.base_layer, "qzeros") and hasattr(module.base_layer, "scales")):
+        if not (
+            hasattr(module, "base_layer")
+            and hasattr(module.base_layer, "qzeros")
+            and hasattr(module.base_layer, "scales")
+        ):
             return
 
         # --- 1. Parameter sammeln ---
@@ -397,9 +402,9 @@ class QALoraLinearVariant(LoraVariant):
 
         # Holen Sie die Gruppengrößen aus den Modul-Attributen
         qalora_group_size = module.qalora_group_size[active_adapter]
-        gptq_group_size = module.base_layer.group_size
+        gptq_group_size = getattr(module.base_layer, "group_size", 32)
 
-        amplification_factor = kwargs.get("amplification_factor", 20.0)
+        amplification_factor = kwargs.get("amplification_factor", 4.0)
         effective_scale = (lora_alpha / lora_r) * amplification_factor
 
         with torch.no_grad():
@@ -423,38 +428,46 @@ class QALoraLinearVariant(LoraVariant):
             # indem wir den Mittelwert über jede Gruppe bilden.
             # Shape: [in_features / gptq_group_size, out_features]
             num_groups = scales.shape[0]
-            lora_contribution_grouped = lora_contribution_full.view(
-                num_groups, gptq_group_size, -1
-            ).mean(dim=1)
+            lora_contribution_grouped = lora_contribution_full.view(num_groups, gptq_group_size, -1).mean(dim=1)
 
-            # --- 5. Finale Formel anwenden ---
-            # adjustment = grouped_lora_contribution * scale / scales
-            # Wir teilen hier NICHT durch die group_size, da wir bereits den Mittelwert gebildet haben.
-            float_adjustment = lora_contribution_grouped * effective_scale / scales
+            # --- 5. LoRA-Adjustment im Gewichtsraum berechnen ---
+            # adjustment = grouped_lora_contribution * effective_scale
+            # Dies ist bereits im Gewichtsraum, nicht im quantisierten Raum
+            weight_adjustment = lora_contribution_grouped * effective_scale
 
-            # --- 6. Originale qzeros entpacken ---
-            bits = getattr(module, "bits", 4)
+            # --- 6. Originale qzeros entpacken und vollständig dequantisieren ---
+            bits = getattr(module.base_layer, "bits", 4)
             mask = (2**bits) - 1
+
             if qzeros_packed.dtype != torch.int32:
                 print("Warning: qzeros are not in packed int32 format. Skipping merge.")
                 return
 
             elements_per_packed_val = 32 // bits
-            shifts = torch.arange(0, elements_per_packed_val * bits, bits, device=qzeros_packed.device, dtype=torch.int32).unsqueeze(0)
+            shifts = torch.arange(
+                0, elements_per_packed_val * bits, bits, device=qzeros_packed.device, dtype=torch.int32
+            ).unsqueeze(0)
+
+            # Entpacken der quantisierten qzeros (0-15 für 4-bit)
             unpacked_qzeros = (qzeros_packed.unsqueeze(-1) >> shifts) & mask
             unpacked_qzeros = unpacked_qzeros.view(qzeros_packed.shape[0], -1)
-            unpacked_qzeros = unpacked_qzeros[:, :scales.shape[1]]
+            unpacked_qzeros = unpacked_qzeros[:, : scales.shape[1]]
 
-            # --- 7. Neue FP16 qzeros berechnen und ersetzen ---
-            new_qzeros_fp16 = unpacked_qzeros.to(torch.float16) - float_adjustment.to(torch.float16)
+            # WICHTIG: Vollständige Dequantisierung der qzeros in den Gewichtsraum
+            # Dies konvertiert von quantisierten Werten (0-15) zu echten Zero-Point-Werten
+            dequantized_qzeros = unpacked_qzeros.to(torch.float16) * scales
 
+            # --- 7. LoRA-Shift auf dequantisierte qzeros anwenden ---
+            # Jetzt können wir den weight_adjustment direkt subtrahieren
+            new_qzeros_fp16 = dequantized_qzeros - weight_adjustment.to(torch.float16)
+
+            # --- 8. Alten qzeros-Parameter durch den neuen ersetzen ---
             del module.base_layer.qzeros
-            module.base_layer.register_parameter(
-                "qzeros", torch.nn.Parameter(new_qzeros_fp16, requires_grad=False)
+            module.base_layer.register_parameter("qzeros", torch.nn.Parameter(new_qzeros_fp16, requires_grad=False))
+
+            print(
+                f"Merged adapter into qzeros for layer. New qzeros shape: {new_qzeros_fp16.shape}, dtype: {new_qzeros_fp16.dtype}"
             )
-            print(f"Merged adapter into qzeros for layer {module.adapter_layer_names[0]}.")
-
-
 
     @staticmethod
     def unmerge(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
