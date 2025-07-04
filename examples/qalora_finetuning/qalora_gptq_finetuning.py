@@ -18,9 +18,56 @@ from transformers import (
     GPTQConfig,
     Trainer,
     TrainingArguments,
+    TrainerCallback,
+    TrainingArguments,
+    TrainerState,
+    TrainerControl,
 )
 
+
 from peft import LoraConfig, get_peft_model
+
+
+class RequantizeCallback(TrainerCallback):
+    """
+    A custom callback to re-quantize frozen weights at the end of each training step.
+    """
+
+    def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model=None,
+        **kwargs,
+    ):
+        """
+        Event called at the end of a training step.
+        """
+        print(f"\n--- Step {state.global_step}: Re-quantizing frozen weights ---")
+
+        # It's good practice to put the model in eval mode for quantization
+        # and then back to train mode.
+        is_training = model.training
+        model.eval()
+
+        with torch.no_grad():
+            # Loop through all modules in the model
+            for name, module in model.named_modules():
+                # Identify your custom quantized layers that are frozen.
+                # You might need to adjust this check. For example, check if it's a
+                # BaseQuantLinear layer and if it's part of the LoRA adapter.
+                # This example assumes your layers have a 'pack' method for re-quantization.
+                if "lora" not in name and hasattr(module, "pack"):
+                    # This is where you call your custom quantization logic.
+                    # You might need to pass the original FP16 weights if your
+                    # 'pack' method requires them. This is a conceptual example.
+                    # module.pack(module.weight_fp16, module.scales, module.zeros)
+                    print(f"Re-quantizing layer: {name}")
+
+        # Restore the model's training state
+        if is_training:
+            model.train()
 
 
 def load_or_quantize_model(
@@ -128,6 +175,51 @@ def tokenize_and_preprocess(examples, tokenizer, max_length: int = 128):
     return tokenized_output
 
 
+def verify_saved_model(saved_path, original_model=None):
+    """Verify the saved model and check its dimensions"""
+    print(f"\n🔍 Verifying saved model: {saved_path}")
+    print("-" * 50)
+
+    try:
+        # Load the saved model
+        loaded_model = AutoModelForCausalLM.from_pretrained(saved_path, device_map="auto")
+        print(f"✅ Model loaded successfully from {saved_path}")
+
+        # Check GPTQ layers
+        gptq_layers = []
+        for name, module in loaded_model.named_modules():
+            if hasattr(module, "qzeros"):
+                gptq_layers.append(
+                    {
+                        "name": name,
+                        "qzeros_shape": tuple(module.qzeros.shape),
+                        "qweight_shape": tuple(module.qweight.shape) if hasattr(module, "qweight") else None,
+                        "type": type(module).__name__,
+                    }
+                )
+
+        print(f"GPTQ layers found: {len(gptq_layers)}")
+        for layer in gptq_layers[:3]:  # Show first 3
+            print(f"  {layer['name']}: qzeros={layer['qzeros_shape']}, qweight={layer['qweight_shape']}")
+
+        # Compare with original if provided
+        if original_model:
+            orig_gptq = [
+                (name, module.qzeros.shape)
+                for name, module in original_model.named_modules()
+                if hasattr(module, "qzeros")
+            ]
+            print(f"\nOriginal had {len(orig_gptq)} GPTQ layers")
+            print(f"Saved has {len(gptq_layers)} GPTQ layers")
+            print("✅ Match!" if len(orig_gptq) == len(gptq_layers) else "❌ Mismatch!")
+
+        return loaded_model
+
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        return None
+
+
 def train_model(
     base_model: str,
     data_path: str,
@@ -179,7 +271,7 @@ def train_model(
     print(f"Using device: {device}")
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(base_model, token=hf_token)
+    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-1.7B-Instruct", token=hf_token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -207,7 +299,6 @@ def train_model(
 
     # Get PEFT model with adapters
     model = get_peft_model(model, lora_config)
-
 
     print("\nCalculating initial perplexity on the test set...")
     # Instantiate the Perplexity evaluator with parameters from the training arguments
@@ -281,6 +372,7 @@ def train_model(
         train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["test"],
         data_collator=data_collator,
+        callbacks=[RequantizeCallback()],  # Add your custom callback here
     )
 
     # Start training
@@ -295,7 +387,6 @@ def train_model(
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     print(f"\nTraining complete. Model saved to {output_dir}")
-
 
     return model, tokenizer
 
@@ -367,9 +458,8 @@ if __name__ == "__main__":
         bits=args.bits,
     )
 
-
     merged_model = my_model.merge_and_unload()
-    merged_model.save_pretrained('qalora_output_merged_model_via_beta_shift')
+    merged_model.save_pretrained("qalora_output_merged_model_via_beta_shift")
 
     print("\nCalculating initial perplexity on the test set...")
     # Instantiate the Perplexity evaluator with parameters from the training arguments

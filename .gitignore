@@ -143,3 +143,8 @@ wandb
 # method_comparison logs
 method_comparison/MetaMathQA/cancelled_results/
 method_comparison/MetaMathQA/temporary_results/
+
+quantized_models
+qalora_output_merged_model_via_beta_shift
+qalora_output_merged_model_fixed
+qalora_output
