@@ -25,12 +25,40 @@ from transformers import (
 )
 
 
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
+from peft.tuners.lora import Linear as LoraLinear
+from peft.tuners.lora.layer import LoraVariant
+from peft.tuners.lora import GPTQLoraLinear, Linear as LoraLinear
+
+
+
+def quantize_layer(weight_fp16, bits=4, group_size=32):
+    """
+    A placeholder function to represent the quantization of a single layer's weights.
+    You will need to replace this with actual GPTQ quantization logic.
+    This is a non-trivial task and might require invoking parts of a library like AutoGPTQ.
+
+    Args:
+        weight_fp16 (torch.Tensor): The full-precision (or fp16) weights to quantize.
+        bits (int): The number of bits for quantization.
+        group_size (int): The group size for quantization.
+
+    Returns:
+        A tuple of (qweight, qzeros, scales).
+    """
+    # This is a conceptual placeholder. The actual implementation is complex.
+    # You would need to adapt a GPTQ quantization kernel here.
+    # For now, we'll print a warning and do nothing.
+    print(f"WARNING: quantize_layer is a placeholder and did not perform real quantization.")
+    # In a real scenario, you would return the new quantized parameters.
+    # e.g., return gptq_quantize(weight_fp16, bits, group_size)
+    return None, None, None
 
 
 class RequantizeCallback(TrainerCallback):
     """
-    A custom callback to re-quantize frozen weights at the end of each training step.
+    A custom callback to re-quantize the base model's weights at the end of each epoch
+    by merging the LoRA adapter weights.
     """
 
     def on_step_end(
@@ -38,34 +66,60 @@ class RequantizeCallback(TrainerCallback):
         args: TrainingArguments,
         state: TrainerState,
         control: TrainerControl,
-        model=None,
+        model: PeftModel = None,
         **kwargs,
     ):
         """
-        Event called at the end of a training step.
+        Event called at the end of an epoch.
         """
-        print(f"\n--- Step {state.global_step}: Re-quantizing frozen weights ---")
+        print(f"\n--- Epoch {state.epoch}: Merging adapter and re-quantizing model ---")
 
-        # It's good practice to put the model in eval mode for quantization
-        # and then back to train mode.
+        # It's crucial to put the model in eval mode for this operation
         is_training = model.training
         model.eval()
 
         with torch.no_grad():
-            # Loop through all modules in the model
             for name, module in model.named_modules():
-                # Identify your custom quantized layers that are frozen.
-                # You might need to adjust this check. For example, check if it's a
-                # BaseQuantLinear layer and if it's part of the LoRA adapter.
-                # This example assumes your layers have a 'pack' method for re-quantization.
-                if "lora" not in name and hasattr(module, "pack"):
-                    # This is where you call your custom quantization logic.
-                    # You might need to pass the original FP16 weights if your
-                    # 'pack' method requires them. This is a conceptual example.
-                    # module.pack(module.weight_fp16, module.scales, module.zeros)
-                    print(f"Re-quantizing layer: {name}")
+                # We are looking for the LoRA layers that replaced the original quantized layers
+                if isinstance(module, GPTQLoraLinear):
+                    print(f"Processing layer: {name}")
 
-        # Restore the model's training state
+                    # 1. Get the merged, full-precision weights
+                    # The `weight` attribute of a LoraLinear layer gives the merged weights
+                    merged_weight_fp16 = module.weight.data.clone().to(torch.float16)
+
+                    # 2. Access the original quantized layer
+                    # The original layer is stored in the `base_layer` attribute
+                    base_quant_layer = module.base_layer
+
+                    # 3. Re-quantize the merged weights
+                    # This is the most complex step. You need a function that can perform
+                    # GPTQ quantization on a single weight tensor.
+                    # We use our placeholder function here.
+                    # You would also need to know the quantization parameters like bits and group_size.
+                    bits = base_quant_layer.bits
+                    group_size = base_quant_layer.group_size
+
+                    new_qweight, new_qzeros, new_scales = quantize_layer(
+                        merged_weight_fp16, bits=bits, group_size=group_size
+                    )
+
+                    # 4. Update the quantized layer's parameters
+                    # If quantization was successful, update the layer's state.
+                    if new_qweight is not None and new_qzeros is not None and new_scales is not None:
+                        base_quant_layer.qweight.copy_(new_qweight)
+                        base_quant_layer.qzeros.copy_(new_qzeros)
+                        base_quant_layer.scales.copy_(new_scales)
+                        print(f"Successfully re-quantized layer: {name}")
+                    else:
+                        print(f"Skipping update for layer {name} due to placeholder quantization.")
+
+            # After updating the weights, we need to reset the LoRA adapters
+            # because their learned weights are now "baked" into the base model.
+            print("Resetting LoRA adapter weights after merging.")
+            model.reset_adapter()
+
+        # Restore the model's original training state
         if is_training:
             model.train()
 
@@ -300,6 +354,19 @@ def train_model(
     # Get PEFT model with adapters
     model = get_peft_model(model, lora_config)
 
+
+
+    model = get_peft_model(model, lora_config)
+
+    # --- DEBUGGING-SCHRITT HINZUFÜGEN ---
+    print("--- Model structure after applying PEFT ---")
+    print(model)
+    print("-----------------------------------------")
+    # ------------------------------------
+
+    # Verify the model was created correctly
+    model.print_trainable_parameters()
+    
     print("\nCalculating initial perplexity on the test set...")
     # Instantiate the Perplexity evaluator with parameters from the training arguments
     ppl_evaluator = Perplexity(
