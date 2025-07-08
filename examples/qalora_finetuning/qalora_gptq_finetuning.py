@@ -34,7 +34,7 @@ class RequantizeCallback(TrainerCallback):
     Handles proper dimension alignment for scales and zeros tensors.
     """
 
-    def __init__(self, ppl_evaluator: Perplexity, requantize_every: int = 100):
+    def __init__(self, ppl_evaluator: Perplexity, requantize_every: int = 5):
         """
         Initialize the RequantizeCallback with a perplexity evaluator.
 
@@ -45,6 +45,35 @@ class RequantizeCallback(TrainerCallback):
         self.ppl_evaluator = ppl_evaluator
         self.requantize_every = requantize_every
         self.last_requantize_step = 0
+        self.adapter_data = {}
+
+    def monitor_adapters(self, model, step):
+        """Monitor adapter sizes in a simple function"""
+        print(f"\n📊 Step {step} - Adapter Sizes:")
+
+        for name, module in model.named_modules():
+            if isinstance(module, GPTQLoraLinear):
+                base_weights = module.base_layer.dequantize_weight()
+                base_norm = torch.norm(base_weights).item()
+
+                # Get LoRA delta
+                for active_adapter in module.active_adapter:
+                    lora_A = module.lora_A[active_adapter].weight
+                    lora_B = module.lora_B[active_adapter].weight
+                    scaling = module.scaling[active_adapter]
+                    lora_delta = scaling * (lora_B @ lora_A)
+                    lora_norm = torch.norm(lora_delta).item()
+
+                    # Relative size
+                    relative_size = lora_norm / base_norm if base_norm > 0 else 0
+
+                    # Store data
+                    layer_name = name.split(".")[-1]
+                    if layer_name not in self.adapter_data:
+                        self.adapter_data[layer_name] = []
+                    self.adapter_data[layer_name].append((step, relative_size))
+
+                    print(f"  {layer_name}: LoRA/Base = {relative_size:.6f}")
 
     def on_step_end(
         self,
@@ -58,6 +87,7 @@ class RequantizeCallback(TrainerCallback):
         # Only requantize every nth step to avoid overhead
         if state.global_step % self.requantize_every != 0:
             return
+        self.monitor_adapters(model, state.global_step)
 
         print(f"\n--- Step {state.global_step}: Merging adapter and re-quantizing model ---")
 
@@ -66,12 +96,15 @@ class RequantizeCallback(TrainerCallback):
 
         successful_merges = 0
         total_layers = 0
+        perplexity_scores = self.ppl_evaluator.calculate()
+        if perplexity_scores:
+            print(f"{self.requantize_every} perplexity calculated. Before merge  score: {perplexity_scores[-1]:.4f}")
 
         with torch.no_grad():
             for name, module in model.named_modules():
                 if isinstance(module, GPTQLoraLinear):
                     base_quant_layer = module.base_layer
-                    print(base_quant_layer.qweight)
+                    # print(base_quant_layer.qweight)
                     base_weights = base_quant_layer.dequantize_weight()
 
                     for active_adapter in module.active_adapter:
@@ -82,22 +115,23 @@ class RequantizeCallback(TrainerCallback):
 
                             # Calculate LoRA delta: scaling * (B @ A)
                             lora_delta = scaling * (lora_B @ lora_A)
-                            print(f"LoRA delta shape: {lora_delta.shape}")
-                            print(f"LoRA scaling factor: {scaling}")
+                            # print(f"LoRA delta shape: {lora_delta.shape}")
+                            # print(f"LoRA scaling factor: {scaling}")
 
                             # 3. Get combined weights (base + LoRA)
                             combined_weights = base_weights + lora_delta.T
+                            base_quant_layer.quantize_to_int(combined_weights)
                     # 1. Originalgewichte holen
                     # dequant = base_quant_layer.dequantize_weight()
-                    print("dequant1", base_quant_layer.quantize_to_int(combined_weights)[0][:5])
-                    dequant2 = base_quant_layer.dequantize_weight()
-                    print("dequant2", base_quant_layer.quantize_to_int(dequant2)[0][:5])
-                    dequant3 = base_quant_layer.dequantize_weight()
-                    print("dequant3", base_quant_layer.quantize_to_int(dequant3)[0][:5])
+                    # print("dequant1", base_quant_layer.quantize_to_int(combined_weights)[0][:5])
+                    # dequant2 = base_quant_layer.dequantize_weight()
+                    # print("dequant2", base_quant_layer.quantize_to_int(dequant2)[0][:5])
+                    # dequant3 = base_quant_layer.dequantize_weight()
+                    # print("dequant3", base_quant_layer.quantize_to_int(dequant3)[0][:5])
 
         print(f"Successfully merged {successful_merges}/{total_layers} layers")
 
-        perplexity_scores = ppl_evaluator.calculate()
+        perplexity_scores = self.ppl_evaluator.calculate()
         if perplexity_scores:
             print(f"{self.requantize_every} perplexity calculated. Final score: {perplexity_scores[-1]:.4f}")
 
@@ -329,7 +363,7 @@ def train_model(
     print("use_qalora", use_qalora)
     lora_config = LoraConfig(
         task_type="CAUSAL_LM",
-        use_qalora=False,
+        use_qalora=True,
         qalora_group_size=qalora_group_size,
         r=lora_r,
         lora_alpha=lora_alpha,
