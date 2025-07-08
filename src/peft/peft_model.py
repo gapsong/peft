@@ -17,6 +17,7 @@ from __future__ import annotations
 import collections
 import copy
 import inspect
+import math
 import os
 import warnings
 from contextlib import contextmanager, nullcontext
@@ -1388,6 +1389,36 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         if not self.peft_config[adapter_name].is_prompt_learning:
             self.base_model.set_adapter(adapter_name)
         _set_adapter(self, adapter_name)
+
+    def reset_adapter(self, adapter_name: Optional[str] = None) -> None:
+        """
+        Reset the adapter weights to their initial state.
+
+        This is useful after merging adapter weights into the base model,
+        to reset the adapters for continued training.
+
+        Args:
+            adapter_name (`str`, *optional*):
+                The name of the adapter to reset. If None, resets the active adapter.
+        """
+        if adapter_name is None:
+            adapter_name = self.active_adapter
+
+        if adapter_name not in self.peft_config:
+            raise ValueError(f"Adapter {adapter_name} not found.")
+
+        for name, module in self.base_model.named_modules():
+            if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+                # Manual reset for LoRA-style adapters
+                if hasattr(module, "lora_A") and isinstance(module.lora_A, torch.nn.ModuleDict):
+                    if adapter_name in module.lora_A:
+                        # Reset lora_A with kaiming uniform (as typically done in LoRA)
+                        torch.nn.init.kaiming_uniform_(module.lora_A[adapter_name].weight, a=math.sqrt(5))
+
+                if hasattr(module, "lora_B") and isinstance(module.lora_B, torch.nn.ModuleDict):
+                    if adapter_name in module.lora_B:
+                        # Reset lora_B to zero (as typically done in LoRA)
+                        torch.nn.init.zeros_(module.lora_B[adapter_name].weight)
 
     @property
     def base_model_torch_dtype(self):
