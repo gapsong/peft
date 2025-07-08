@@ -27,15 +27,24 @@ from transformers import (
 from peft import LoraConfig, get_peft_model, PeftModel
 from peft.tuners.lora import GPTQLoraLinear
 
+
 class RequantizeCallback(TrainerCallback):
     """
     A custom callback to re-quantize the base model's weights by merging the LoRA adapters.
     Handles proper dimension alignment for scales and zeros tensors.
     """
 
-    def __init__(self, frequency=1):
-        """Initialize the callback with requantization frequency."""
-        self.frequency = frequency
+    def __init__(self, ppl_evaluator: Perplexity, requantize_every: int = 100):
+        """
+        Initialize the RequantizeCallback with a perplexity evaluator.
+
+        Args:
+            ppl_evaluator (Perplexity): The perplexity evaluator to use for validation
+            requantize_every (int): How often to perform requantization (in steps)
+        """
+        self.ppl_evaluator = ppl_evaluator
+        self.requantize_every = requantize_every
+        self.last_requantize_step = 0
 
     def on_step_end(
         self,
@@ -47,7 +56,7 @@ class RequantizeCallback(TrainerCallback):
     ):
         """Event called at the end of a training step."""
         # Only requantize every nth step to avoid overhead
-        if state.global_step % self.frequency != 0:
+        if state.global_step % self.requantize_every != 0:
             return
 
         print(f"\n--- Step {state.global_step}: Merging adapter and re-quantizing model ---")
@@ -63,17 +72,34 @@ class RequantizeCallback(TrainerCallback):
                 if isinstance(module, GPTQLoraLinear):
                     base_quant_layer = module.base_layer
                     print(base_quant_layer.qweight)
+                    base_weights = base_quant_layer.dequantize_weight()
+
+                    for active_adapter in module.active_adapter:
+                        if active_adapter in module.lora_A:
+                            lora_A = module.lora_A[active_adapter].weight
+                            lora_B = module.lora_B[active_adapter].weight
+                            scaling = module.scaling[active_adapter]
+
+                            # Calculate LoRA delta: scaling * (B @ A)
+                            lora_delta = scaling * (lora_B @ lora_A)
+                            print(f"LoRA delta shape: {lora_delta.shape}")
+                            print(f"LoRA scaling factor: {scaling}")
+
+                            # 3. Get combined weights (base + LoRA)
+                            combined_weights = base_weights + lora_delta.T
                     # 1. Originalgewichte holen
-                    dequant = base_quant_layer.dequantize_weight()
-                    print("dequant1",base_quant_layer.quantize_to_int(dequant)[0][:5])
+                    # dequant = base_quant_layer.dequantize_weight()
+                    print("dequant1", base_quant_layer.quantize_to_int(combined_weights)[0][:5])
                     dequant2 = base_quant_layer.dequantize_weight()
                     print("dequant2", base_quant_layer.quantize_to_int(dequant2)[0][:5])
                     dequant3 = base_quant_layer.dequantize_weight()
-                    print("dequant3",base_quant_layer.quantize_to_int(dequant3)[0][:5])
-
-
+                    print("dequant3", base_quant_layer.quantize_to_int(dequant3)[0][:5])
 
         print(f"Successfully merged {successful_merges}/{total_layers} layers")
+
+        perplexity_scores = ppl_evaluator.calculate()
+        if perplexity_scores:
+            print(f"{self.requantize_every} perplexity calculated. Final score: {perplexity_scores[-1]:.4f}")
 
         # Reset LoRA adapters if any merges were successful
         if successful_merges > 0:
@@ -324,20 +350,20 @@ def train_model(
     # Verify the model was created correctly
     model.print_trainable_parameters()
 
-    # print("\nCalculating initial perplexity on the test set...")
-    # # Instantiate the Perplexity evaluator with parameters from the training arguments
-    # ppl_evaluator = Perplexity(
-    #     model=model,
-    #     tokenizer=tokenizer,
-    #     dataset_path=data_path,
-    #     dataset_name=data_split if data_split else None,  # Pass None if the split string is empty
-    #     split="test",  # Evaluate on the test split
-    #     text_column="text",  # Standard text column name
-    # )
-    # # Calculate perplexity using the sequence length and batch size from training arguments
-    # perplexity_scores = ppl_evaluator.calculate()
-    # if perplexity_scores:
-    #     print(f"Initial perplexity calculated. Final score: {perplexity_scores[-1]:.4f}")
+    print("\nCalculating initial perplexity on the test set...")
+    # Instantiate the Perplexity evaluator with parameters from the training arguments
+    ppl_evaluator = Perplexity(
+        model=model,
+        tokenizer=tokenizer,
+        dataset_path=data_path,
+        dataset_name=data_split if data_split else None,  # Pass None if the split string is empty
+        split="test",  # Evaluate on the test split
+        text_column="text",  # Standard text column name
+    )
+    # Calculate perplexity using the sequence length and batch size from training arguments
+    perplexity_scores = ppl_evaluator.calculate()
+    if perplexity_scores:
+        print(f"Initial perplexity calculated. Final score: {perplexity_scores[-1]:.4f}")
 
     model.print_trainable_parameters()
 
@@ -396,7 +422,7 @@ def train_model(
         train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["test"],
         data_collator=data_collator,
-        callbacks=[RequantizeCallback()],  # Add your custom callback here
+        callbacks=[RequantizeCallback(ppl_evaluator)],  # Add your custom callback here
     )
 
     # Start training
