@@ -6,25 +6,23 @@ This script supports cached quantization to avoid repeating expensive quantizati
 
 import argparse
 import os
-from gptqmodel.utils.perplexity import Perplexity
 
 import torch
 from datasets import load_dataset
+from gptqmodel.utils.perplexity import Perplexity
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     DataCollatorForLanguageModeling,
     GPTQConfig,
     Trainer,
-    TrainingArguments,
     TrainerCallback,
-    TrainingArguments,
-    TrainerState,
     TrainerControl,
+    TrainerState,
+    TrainingArguments,
 )
 
-
-from peft import LoraConfig, get_peft_model, PeftModel
+from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora import GPTQLoraLinear
 
 
@@ -75,7 +73,7 @@ class RequantizeCallback(TrainerCallback):
 
                     # print(f"  {layer_name}: LoRA/Base = {relative_size:.6f}")
 
-    def on_step_end(
+    def on_step_end2(
         self,
         args: TrainingArguments,
         state: TrainerState,
@@ -100,7 +98,6 @@ class RequantizeCallback(TrainerCallback):
         if perplexity_scores:
             print(f"{self.requantize_every} perplexity calculated. Before merge  score: {perplexity_scores[-1]:.4f}")
 
-        return
         with torch.no_grad():
             for name, module in model.named_modules():
                 if isinstance(module, GPTQLoraLinear):
@@ -144,6 +141,32 @@ class RequantizeCallback(TrainerCallback):
         # Restore model's training state
         if is_training:
             model.train()
+
+    def on_epoch_begin(
+        self, args: TrainingArguments, state: TrainerState, control: TrainerControl, model: PeftModel = None, **kwargs
+    ):
+        with torch.no_grad():
+            for name, module in model.named_modules():
+                if isinstance(module, GPTQLoraLinear):
+                    base_quant_layer = module.base_layer
+                    # print(base_quant_layer.qweight)
+                    base_weights = base_quant_layer.dequantize_weight()
+
+                    for active_adapter in module.active_adapter:
+                        if active_adapter in module.lora_A:
+                            lora_A = module.lora_A[active_adapter].weight
+                            lora_B = module.lora_B[active_adapter].weight
+                            scaling = module.scaling[active_adapter]
+
+                            # Calculate LoRA delta: scaling * (B @ A)
+                            lora_delta = scaling * (lora_B @ lora_A)
+                            # print(f"LoRA delta shape: {lora_delta.shape}")
+                            # print(f"LoRA scaling factor: {scaling}")
+
+                            # 3. Get combined weights (base + LoRA)
+                            combined_weights = base_weights + lora_delta.T
+                            # base_quant_layer.quantize_to_int(combined_weights)
+                            base_quant_layer.replace_random_groups_with_packed_structure(replacement_prob=0.1)
 
 
 def load_or_quantize_model(
