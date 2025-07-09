@@ -73,7 +73,7 @@ class RequantizeCallback(TrainerCallback):
                         self.adapter_data[layer_name] = []
                     self.adapter_data[layer_name].append((step, relative_size))
 
-                    print(f"  {layer_name}: LoRA/Base = {relative_size:.6f}")
+                    # print(f"  {layer_name}: LoRA/Base = {relative_size:.6f}")
 
     def on_step_end(
         self,
@@ -85,7 +85,7 @@ class RequantizeCallback(TrainerCallback):
     ):
         """Event called at the end of a training step."""
         # Only requantize every nth step to avoid overhead
-        if state.global_step % self.requantize_every != 0:
+        if state.global_step % self.requantize_every != 0 or state.global_step < 40:
             return
         self.monitor_adapters(model, state.global_step)
 
@@ -100,6 +100,7 @@ class RequantizeCallback(TrainerCallback):
         if perplexity_scores:
             print(f"{self.requantize_every} perplexity calculated. Before merge  score: {perplexity_scores[-1]:.4f}")
 
+        return
         with torch.no_grad():
             for name, module in model.named_modules():
                 if isinstance(module, GPTQLoraLinear):
@@ -146,7 +147,7 @@ class RequantizeCallback(TrainerCallback):
 
 
 def load_or_quantize_model(
-    base_model: str, tokenizer, bits: int = 4, cache_dir: str = "./quantized_models"
+    base_model: str, tokenizer, qalora_group_size=32, bits: int = 4, cache_dir: str = "./quantized_models"
 ) -> AutoModelForCausalLM:
     """
     Load a pre-quantized model from cache or quantize and cache a new one.
@@ -209,7 +210,7 @@ def load_or_quantize_model(
         bits=bits,
         dataset="c4",
         tokenizer=tokenizer,
-        group_size=32,
+        group_size=qalora_group_size,
         desc_act=False,
         sym=False,
     )
@@ -351,7 +352,7 @@ def train_model(
         tokenizer.pad_token = tokenizer.eos_token
 
     # Load or quantize model
-    model = load_or_quantize_model(base_model, tokenizer, bits=bits)
+    model = load_or_quantize_model(base_model, tokenizer, qalora_group_size=qalora_group_size, bits=bits)
 
     # Configure LoRA
     target_modules = (
@@ -472,6 +473,8 @@ def train_model(
     tokenizer.save_pretrained(output_dir)
     print(f"\nTraining complete. Model saved to {output_dir}")
 
+    endresult = ppl_evaluator.calculate()
+    print("Endresult: ", endresult)
     return model, tokenizer
 
 
