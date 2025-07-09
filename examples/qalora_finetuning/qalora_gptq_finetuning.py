@@ -145,6 +145,12 @@ class RequantizeCallback(TrainerCallback):
     def on_epoch_begin(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, model: PeftModel = None, **kwargs
     ):
+        perplexity_scores = self.ppl_evaluator.calculate()
+        if perplexity_scores:
+            print(
+                f"{self.requantize_every} perplexity calculated. Before replacements  score: {perplexity_scores[-1]:.4f}"
+            )
+
         with torch.no_grad():
             for name, module in model.named_modules():
                 if isinstance(module, GPTQLoraLinear):
@@ -167,6 +173,12 @@ class RequantizeCallback(TrainerCallback):
                             combined_weights = base_weights + lora_delta.T
                             # base_quant_layer.quantize_to_int(combined_weights)
                             base_quant_layer.replace_random_groups_with_packed_structure(replacement_prob=0.1)
+
+        perplexity_scores = self.ppl_evaluator.calculate()
+        if perplexity_scores:
+            print(
+                f"{self.requantize_every} perplexity calculated after replacements score: {perplexity_scores[-1]:.4f}"
+            )
 
 
 def load_or_quantize_model(
