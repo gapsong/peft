@@ -32,7 +32,7 @@ class RequantizeCallback(TrainerCallback):
     Handles proper dimension alignment for scales and zeros tensors.
     """
 
-    def __init__(self, ppl_evaluator: Perplexity, requantize_every: int = 5):
+    def __init__(self, ppl_evaluator: Perplexity, requantize_every: int = 100):
         """
         Initialize the RequantizeCallback with a perplexity evaluator.
 
@@ -73,7 +73,7 @@ class RequantizeCallback(TrainerCallback):
 
                     # print(f"  {layer_name}: LoRA/Base = {relative_size:.6f}")
 
-    def on_step_end2(
+    def on_step_end(
         self,
         args: TrainingArguments,
         state: TrainerState,
@@ -83,7 +83,7 @@ class RequantizeCallback(TrainerCallback):
     ):
         """Event called at the end of a training step."""
         # Only requantize every nth step to avoid overhead
-        if state.global_step % self.requantize_every != 0 or state.global_step < 40:
+        if state.global_step % self.requantize_every != 0:
             return
         self.monitor_adapters(model, state.global_step)
 
@@ -98,6 +98,7 @@ class RequantizeCallback(TrainerCallback):
         if perplexity_scores:
             print(f"{self.requantize_every} perplexity calculated. Before merge  score: {perplexity_scores[-1]:.4f}")
 
+        # return
         with torch.no_grad():
             for name, module in model.named_modules():
                 if isinstance(module, GPTQLoraLinear):
@@ -142,7 +143,7 @@ class RequantizeCallback(TrainerCallback):
         if is_training:
             model.train()
 
-    def on_epoch_begin(
+    def on_epoch_begin2(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, model: PeftModel = None, **kwargs
     ):
         perplexity_scores = self.ppl_evaluator.calculate()
@@ -152,6 +153,7 @@ class RequantizeCallback(TrainerCallback):
             )
 
         with torch.no_grad():
+            i = 0
             for name, module in model.named_modules():
                 if isinstance(module, GPTQLoraLinear):
                     base_quant_layer = module.base_layer
@@ -159,7 +161,7 @@ class RequantizeCallback(TrainerCallback):
                     base_weights = base_quant_layer.dequantize_weight()
 
                     for active_adapter in module.active_adapter:
-                        if active_adapter in module.lora_A:
+                        if active_adapter in module.lora_A and "attn" not in name:
                             lora_A = module.lora_A[active_adapter].weight
                             lora_B = module.lora_B[active_adapter].weight
                             scaling = module.scaling[active_adapter]
@@ -172,7 +174,11 @@ class RequantizeCallback(TrainerCallback):
                             # 3. Get combined weights (base + LoRA)
                             combined_weights = base_weights + lora_delta.T
                             # base_quant_layer.quantize_to_int(combined_weights)
-                            base_quant_layer.replace_random_groups_with_packed_structure(replacement_prob=0.1)
+                            # base_quant_layer.analyze_id_histogram_per_position(name)
+                            # base_quant_layer.analyze_id_distribution(name)
+                            print("name", name)
+                            # base_quant_layer.replace_random_groups_with_packed_structure(replacement_prob=0.05, seed=i)
+                            i += 1
 
         perplexity_scores = self.ppl_evaluator.calculate()
         if perplexity_scores:
@@ -399,13 +405,14 @@ def train_model(
     print("use_qalora", use_qalora)
     lora_config = LoraConfig(
         task_type="CAUSAL_LM",
-        use_qalora=True,
+        use_qalora=False,
         qalora_group_size=qalora_group_size,
         r=lora_r,
         lora_alpha=lora_alpha,
         target_modules=target_modules,
         lora_dropout=lora_dropout,
         bias="none",
+        # init_lora_weights="pissa_niter_4", # Initialize the PiSSA with fast SVD, which completes in just a few seconds.
     )
 
     # Get PEFT model with adapters
@@ -595,5 +602,6 @@ if __name__ == "__main__":
     )
     # Calculate perplexity using the sequence length and batch size from training arguments
     perplexity_scores = ppl_evaluator.calculate()
+    print(perplexity_scores)
     if perplexity_scores:
         print(f"Initial perplexity calculated. Final score: {perplexity_scores[-1]:.4f}")

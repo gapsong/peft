@@ -148,3 +148,6 @@ quantized_models
 qalora_output_merged_model_via_beta_shift
 qalora_output_merged_model_fixed
 qalora_output
+histograms
+*eval_results*
+*train_results*
