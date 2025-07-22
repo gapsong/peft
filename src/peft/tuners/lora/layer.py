@@ -224,6 +224,9 @@ class LoraLayer(BaseTunerLayer):
         self.use_dora[adapter_name] = use_dora
 
         # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
+        if isinstance(init_lora_weights, str) and init_lora_weights.startswith("daniel"):
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.daniel_init(adapter_name, init_lora_weights)
         if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
             with gather_params_ctx(self.get_base_layer().weight):
                 self.pissa_init(adapter_name, init_lora_weights)
@@ -273,6 +276,66 @@ class LoraLayer(BaseTunerLayer):
                 # embeddings are not supported at the moment, but still adding this for consistency
                 nn.init.zeros_(self.lora_embedding_B[adapter_name].bias)
 
+    def daniel_init(self, adapter_name, init_lora_weights):
+            weight = self.get_base_layer().weight
+            dtype = weight.dtype
+            if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+                raise TypeError(
+                    "Please initialize Daniel's method under float32, float16, or bfloat16. "
+                    "Subsequently, re-quantize the residual model to help minimize quantization errors."
+                )
+
+            # W = weight matrix, transpose if needed
+            W = transpose(weight.to(torch.float32), self.fan_in_fan_out)
+
+            # Get dimensions
+            D_out, D_in = W.shape  # W is (output_dim, input_dim)
+            r = self.r[adapter_name]  # rank
+
+            if init_lora_weights == "daniel":
+                # Full SVD: W = U @ S @ V^T
+                U, S, Vh = torch.linalg.svd(W.data, full_matrices=False)
+                V = Vh.t()  # Convert V^T to V
+
+                # Cut to rank r
+                U_r = U[:, :r]  # (D_out, r)
+                S_r = S[:r]  # (r,)
+                V_r = V[:, :r]  # (D_in, r)
+
+            elif len(init_lora_weights.split("_niter_")) == 2:
+                # Fast SVD with specified iterations
+                niter = int(init_lora_weights.split("_niter_")[-1])
+                U_r, S_r, V_r_t = svd_lowrank(W.data, r, niter=niter)
+                V_r = V_r_t.t()  # Convert V^T to V: (D_in, r)
+
+            else:
+                raise ValueError(
+                    f"init_lora_weights should be 'daniel' or 'daniel_niter_[number of iters]', got {init_lora_weights} instead."
+                )
+
+            # Apply scaling factor
+            S_r /= self.scaling[adapter_name]
+
+            # Create US = U @ diag(S) - multiply S into U
+            US = U_r @ torch.diag(S_r)  # (D_out, r)
+
+            # Set LoRA weights according to your specification:
+            # lora_A corresponds to US: (r, D_in) - need to transpose US
+            # lora_B corresponds to V: (D_out, r) - need to transpose V_r
+            self.lora_A[adapter_name].weight.data = US.t()  # (r, D_in)
+            self.lora_B[adapter_name].weight.data = V_r.t()  # (r, D_out) -> transposed to (D_out, r)
+
+            # Update base weight: W_new = W - scaling * lora_B @ lora_A
+            # Note: lora_B @ lora_A = V_r.t().t() @ US.t() = V_r @ US.t() = V_r @ (U_r @ diag(S_r)).t()
+            #                       = V_r @ diag(S_r) @ U_r.t()
+            delta_weight = self.scaling[adapter_name] * (V_r @ torch.diag(S_r) @ U_r.t())
+            weight_new = W.data - delta_weight
+
+            # Convert back to original dtype and transpose if needed
+            weight_new = transpose(weight_new.to(dtype), self.fan_in_fan_out)
+            self.get_base_layer().weight.data = weight_new
+
+
     def olora_init(self, adapter_name):
         base_layer = self.get_base_layer()
         orig_weight = base_layer.weight
@@ -317,6 +380,7 @@ class LoraLayer(BaseTunerLayer):
         else:
             weight_tensor = weight_tensor.to(dtype)
             base_layer.weight.data = weight_tensor
+            
 
     def pissa_init(self, adapter_name, init_lora_weights):
         weight = self.get_base_layer().weight
