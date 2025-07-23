@@ -9,7 +9,7 @@ import torch
 import json
 import lm_eval
 from lm_eval.models.huggingface import HFLM
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GPTQConfig
 from peft import PeftModel
 import datasets
 
@@ -163,6 +163,7 @@ def main():
     # Output parameters
     parser.add_argument("--output_dir", type=str, help="Directory to save results")
     parser.add_argument("--test_generation", action="store_true", help="Test model generation before evaluation")
+    parser.add_argument("--apply_gptq_post_quant", type=bool, help="Quantize model with GPTQ after loading")
 
     args = parser.parse_args()
 
@@ -172,9 +173,28 @@ def main():
     # Load model and tokenizer
     model, tokenizer = load_model_and_tokenizer(args.model_name_or_path, args.base_model)
 
-    # Test generation if requested
-    if args.test_generation:
-        test_model_generation(model, tokenizer)
+    if args.apply_gptq_post_quant:
+        print("Applying GPTQ post-quantization...")
+        gptq_config = GPTQConfig(
+            bits=4,
+            dataset="c4",
+            tokenizer=tokenizer,
+            group_size=32,
+            desc_act=False,
+            sym=False,
+        )
+        model = model.merge_and_unload()
+        temp_model_path = "./temp_merged_model"
+
+        model.save_pretrained(temp_model_path)
+
+        # post quantization gptq
+        model = AutoModelForCausalLM.from_pretrained(
+            temp_model_path,
+            quantization_config=gptq_config,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+        )
 
     # Run evaluation
     results = evaluate_with_lm_eval(
@@ -196,8 +216,8 @@ def main():
 
         # Remove samples to reduce file size
         results_clean = results.copy()
-        if 'samples' in results_clean:
-            del results_clean['samples']
+        if "samples" in results_clean:
+            del results_clean["samples"]
 
         with open(output_path, "w") as f:
             json.dump(results_clean, f, indent=2, default=str)

@@ -21,9 +21,8 @@ from typing import Optional
 import torch
 import transformers
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, GPTQConfig, Trainer
-
-from peft import LoraConfig, PeftModel, get_peft_model
+from transformers import AutoModelForCausalLM, GPTQConfig, Trainer, BitsAndBytesConfig
+from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 
 
 IGNORE_INDEX = -100
@@ -100,7 +99,6 @@ class TrainingArguments(transformers.TrainingArguments):
     # Keep legacy flags for backwards compatibility
     corda_mode: bool = field(default=None, metadata={"help": "Deprecated: use --training_mode=corda instead"})
     use_qalora: bool = field(default=None, metadata={"help": "Deprecated: use --training_mode=qalora instead"})
-
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -300,7 +298,7 @@ def train():
     print(script_args)
 
     # Validate training mode
-    valid_modes = ["full", "lora", "qalora", "pissa", "corda"]
+    valid_modes = ["full", "lora", "qlora", "qalora", "pissa", "corda"]
     if script_args.training_mode not in valid_modes:
         raise ValueError(f"Invalid training_mode '{script_args.training_mode}'. Must be one of: {valid_modes}")
 
@@ -321,6 +319,7 @@ def train():
         res_model = transformers.AutoModelForCausalLM.from_pretrained(
             script_args.model_name_or_path,
             device_map="auto",
+            torch_dtype=torch.bfloat16,
         )
         model = PeftModel.from_pretrained(
             res_model, script_args.model_name_or_path, subfolder="corda_init", is_trainable=True
@@ -334,7 +333,7 @@ def train():
 
         lora_config = LoraConfig(
             task_type="CAUSAL_LM",
-            use_qalora=False,
+            use_qalora=True,
             qalora_group_size=script_args.qalora_group_size,
             r=script_args.lora_r,
             lora_alpha=2 * script_args.lora_r,
@@ -368,20 +367,62 @@ def train():
         print("🔧 Setting up LoRA training...")
         model = transformers.AutoModelForCausalLM.from_pretrained(
             script_args.model_name_or_path,
+            torch_dtype=torch.bfloat16,
             device_map="auto",
         )
 
         lora_config = LoraConfig(
             task_type="CAUSAL_LM",
             r=script_args.lora_r,
-            lora_alpha=script_args.lora_r,
+            lora_alpha=2 * script_args.lora_r,
             target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
             lora_dropout=0.05,
             bias="none",
             init_lora_weights=True,
         )
 
+        # model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
         model = get_peft_model(model, lora_config)
+    elif script_args.training_mode == "qlora":
+        print("🔧 Setting up QLoRA training...")
+
+        # Configure 4-bit quantization for QLoRA
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+
+        # Load model with 4-bit quantization
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            script_args.model_name_or_path,
+            quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+
+        # Prepare model for k-bit training (essential for QLoRA)
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+        # Configure LoRA for QLoRA
+        lora_config = LoraConfig(
+            task_type="CAUSAL_LM",
+            r=script_args.lora_r,
+            lora_alpha=2 * script_args.lora_r,
+            target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
+            lora_dropout=0.1,  # Slightly higher dropout for QLoRA
+            bias="none",
+            init_lora_weights=True,
+        )
+
+        model = get_peft_model(model, lora_config)
+
+        # Enable gradient checkpointing for memory efficiency
+        model.gradient_checkpointing_enable()
+
+        print(f"✅ QLoRA model loaded with 4-bit quantization")
 
     elif script_args.training_mode == "full":
         print("🔧 Setting up full finetuning...")
