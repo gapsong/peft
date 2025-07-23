@@ -412,7 +412,7 @@ def train():
             r=script_args.lora_r,
             lora_alpha=2 * script_args.lora_r,
             target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
-            lora_dropout=0.1,  # Slightly higher dropout for QLoRA
+            lora_dropout=0.05,  # Slightly higher dropout for QLoRA
             bias="none",
             init_lora_weights=True,
         )
