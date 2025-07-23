@@ -1,20 +1,20 @@
 #!/bin/bash
 
 # Configuration from launch.json
-BASE_MODEL="HuggingFaceTB/SmolLM2-1.7B-Instruct"
+BASE_MODEL="HuggingFaceTB/SmolLM2-1.7B"
 DATASET="yahma/alpaca-cleaned"
-DATASET_SPLIT="train[:50000]"
+DATASET_SPLIT="train[:10000]"
 
 # Training parameters from launch.json
 LEARNING_RATE="1e-4"
-BATCH_SIZE=8
+BATCH_SIZE=4
 GRAD_ACCUM=1
 NUM_EPOCHS=2
-MAX_LENGTH=256
+MAX_LENGTH=2048
 
 # Training mode selection
-TRAINING_MODE="lora"  # Options: full, lora, qalora, pissa, corda
-LORA_R=16
+TRAINING_MODE="qalora"  # Options: full, lora, qlora, qalora, pissa, corda
+LORA_R=4
 QALORA_GROUP_SIZE=32
 PISSA_NITER=4
 
@@ -22,7 +22,7 @@ PISSA_NITER=4
 WARMUP_RATIO=0.03
 LR_SCHEDULER_TYPE="cosine"
 LOGGING_STEPS=10
-SAVE_STEPS=500
+SAVE_STEPS=25000
 EVAL_STEPS=500
 BF16="True"
 DATALOADER_PIN_MEMORY="False"
