@@ -163,7 +163,7 @@ def main():
     # Output parameters
     parser.add_argument("--output_dir", type=str, help="Directory to save results")
     parser.add_argument("--test_generation", action="store_true", help="Test model generation before evaluation")
-    parser.add_argument("--apply_gptq_post_quant", type=bool, help="Quantize model with GPTQ after loading")
+    parser.add_argument("--apply_gptq_post_quant", action="store_true", help="Quantize model with GPTQ after loading")
 
     args = parser.parse_args()
 
