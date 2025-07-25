@@ -151,3 +151,4 @@ qalora_output
 histograms
 *eval_results*
 *train_results*
+*temp_merged_model*

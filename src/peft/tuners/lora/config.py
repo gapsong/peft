@@ -211,7 +211,8 @@ class LoraConfig(PeftConfig):
             of the passed strings. If this is specified as 'all-linear', then all linear/Conv1D modules are chosen (if
             the model is a PreTrainedModel, the output layer excluded). If this is not specified, modules will be
             chosen according to the model architecture. If the architecture is not known, an error will be raised -- in
-            this case, you should specify the target modules manually.
+            this case, you should specify the target modules manually. To avoid targeting any modules (because you want
+            to apply `target_parameters`), set `target_modules=[]`.
         exclude_modules (`Optional[Union[List[str], str]]`):
             The names of the modules to not apply the adapter. When passing a string, a regex match will be performed.
             When passing a list of strings, either an exact match will be performed or it is checked if the name of the
@@ -233,7 +234,7 @@ class LoraConfig(PeftConfig):
             use the original default value of `lora_alpha/r`.
         modules_to_save (`List[str]`):
             List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
-        init_lora_weights (`bool` | `Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "corda", "loftq"]`):
+        init_lora_weights (`bool` | `Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "corda", "loftq", "orthogonal"]`):
             How to initialize the weights of the adapter layers. Passing True (default) results in the default
             initialization from the reference implementation from Microsoft, with the LoRA B weight being set to 0.
             This means that without further training, the LoRA adapter will be a no-op. Setting the initialization to
@@ -253,7 +254,9 @@ class LoraConfig(PeftConfig):
             using SVD. Passing `'corda'` results in the initialization of <a
             href='https://huggingface.co/papers/2406.05223' >Context-Oriented Decomposition Adaptation</a>, which
             converges even more rapidly than PiSSA in Instruction-Previewed Mode, and preserves world knowledge better
-            than LoRA in Knowledge-Preserved Mode.
+            than LoRA in Knowledge-Preserved Mode. Passing `"orthogonal"` results in LoRA A and B being intialized
+            orthogonally; in this, it resembles `"olora"`, but the base weights are left untouched (requires `r` to be
+            even, only supported for linear layers for now).
         layers_to_transform (`Union[List[int], int]`):
             The layer indices to transform. If a list of ints is passed, it will apply the adapter to the layer indices
             that are specified in this list. If a single integer is passed, it will apply the transformations on the
@@ -308,6 +311,16 @@ class LoraConfig(PeftConfig):
             Defaults to `False`. Whether to enable the bias term for the LoRA B parameter. Typically, this should be
             disabled. The main use case for this is when the LoRA weights were extracted from fully fine-tuned
             parameters so the bias of those parameters can be taken into account.
+        target_parameters (`List[str]`, *optional*)
+            List of parameter names or regex expression of the parameter names to replace with LoRA. This argument
+            behaves similarly to `target_modules`, except that the parameter name should be passed. Generally, you
+            should use `target_modules` to target the module (e.g. `nn.Linear`). However, in some circumstances, this
+            is not possible. E.g., in many mixture of expert (MoE) layers in HF Transformers, instead of using
+            `nn.Linear`, an `nn.Parameter` is used. PEFT normally overwrites the `forward` method for LoRA, but for
+            `nn.Parameter`, there is none. Therefore, to apply LoRA to that parameter, it needs to be targeted with
+            `target_parameters`. As an example, for Llama4, you can pass:
+            `target_parameters=['feed_forward.experts.gate_up_proj', 'feed_forward.experts.down_proj]`. Passing a
+            string for regex matching is not implemented yet.
     """
 
     r: int = field(default=8, metadata={"help": "Lora attention dimension"})
@@ -315,12 +328,14 @@ class LoraConfig(PeftConfig):
         default=None,
         metadata={
             "help": (
-                "List of module names or regex expression of the module names to replace with LoRA."
-                "For example, ['q', 'v'] or '.*decoder.*(SelfAttention|EncDecAttention).*(q|v)$'."
+                "List of module names or regex expression of the module names to replace with LoRA. "
+                "For example, ['q', 'v'] or '.*decoder.*(SelfAttention|EncDecAttention).*(q|v)$'. "
                 "This can also be a wildcard 'all-linear' which matches all linear/Conv1D "
-                "(if the model is a PreTrainedModel, the output layer excluded)."
+                "(if the model is a PreTrainedModel, the output layer excluded). "
                 "If not specified, modules will be chosen according to the model architecture, If the architecture is "
-                "not known, an error will be raised -- in this case, you should specify the target modules manually."
+                "not known, an error will be raised -- in this case, you should specify the target modules manually. "
+                "To avoid targeting any modules (because you want to apply `target_parameters`), set "
+                "`target_modules=[]`."
             ),
         },
     )
@@ -357,7 +372,8 @@ class LoraConfig(PeftConfig):
         },
     )
     init_lora_weights: (
-        bool | Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "corda", "loftq"]
+        bool
+        | Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "corda", "loftq", "orthogonal"]
     ) = field(
         default=True,
         metadata={
@@ -376,7 +392,8 @@ class LoraConfig(PeftConfig):
                 "[number of iters] indicates the number of subspace iterations to perform fsvd, and must be a "
                 "nonnegative integer. "
                 "Passing `'corda'` results in CorDA initialization. "
-                "Pass `'loftq'` to use LoftQ initialization."
+                "Pass `'loftq'` to use LoftQ initialization. "
+                "Pass `'orthogonal'` for orthogonal initialization of LoRA A and B."
             ),
         },
     )
@@ -550,6 +567,22 @@ class LoraConfig(PeftConfig):
             )
         },
     )
+    target_parameters: Optional[list[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "List of parameter names or regex expression of the parameter names to replace with LoRA. "
+                "This argument behaves similarly to `target_modules`, except that the parameter name should be passed. "
+                "Generally, you should use `target_modules` to target the module (e.g. `nn.Linear`). However, in some "
+                "circumstances, this is not possible. E.g., in many mixture of expert (MoE) layers in HF Transformers, "
+                "instead of using `nn.Linear`, an `nn.Parameter` is used. PEFT normally overwrites the `forward` "
+                "method for LoRA, but for `nn.Parameter`, there is none. Therefore, to apply LoRA to that parameter, "
+                "it needs to be targeted with `target_parameters`. As an example, for Llama4, you can pass: "
+                "`target_parameters=['feed_forward.experts.gate_up_proj', 'feed_forward.experts.down_proj]`. Passing a "
+                "string for regex matching is not implemented yet."
+            )
+        },
+    )
 
     def to_dict(self):
         """
@@ -568,6 +601,9 @@ class LoraConfig(PeftConfig):
         self.exclude_modules = (
             set(self.exclude_modules) if isinstance(self.exclude_modules, list) else self.exclude_modules
         )
+
+        if isinstance(self.target_parameters, str):
+            raise TypeError("`target_parameters` must be a list of strings or None.")
 
         # if target_modules is a regex expression, then layers_to_transform should be None
         if isinstance(self.target_modules, str) and self.layers_to_transform is not None:

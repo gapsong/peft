@@ -23,6 +23,8 @@ from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
 from .layer import LoraVariant
 
+from .layer import LoraVariant
+
 
 class GPTQLoraLinear(torch.nn.Module, LoraLayer):
     def __init__(
