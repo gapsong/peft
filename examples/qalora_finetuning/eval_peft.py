@@ -164,6 +164,8 @@ def main():
     parser.add_argument("--output_dir", type=str, help="Directory to save results")
     parser.add_argument("--test_generation", action="store_true", help="Test model generation before evaluation")
     parser.add_argument("--apply_gptq_post_quant", action="store_true", help="Quantize model with GPTQ after loading")
+    parser.add_argument("--bits", type=int, default=4, help="Limit number of samples (for testing)")
+
 
     args = parser.parse_args()
 
@@ -176,7 +178,7 @@ def main():
     if args.apply_gptq_post_quant:
         print("Applying GPTQ post-quantization...")
         gptq_config = GPTQConfig(
-            bits=4,
+            bits=args.bits,
             dataset="c4",
             tokenizer=tokenizer,
             group_size=32,

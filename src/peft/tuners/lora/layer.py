@@ -108,6 +108,7 @@ class LoraLayer(BaseTunerLayer):
         # flag to enable/disable casting of input to weight dtype during forward call
         self.cast_input_dtype_enabled: bool = True
         self.lora_variant: dict[str, LoraVariant] = {}
+        self.fan_in_fan_out = False  # Default to False, can be overridden by subclasses
         self.kwargs = kwargs
 
         base_layer = self.get_base_layer()
@@ -227,9 +228,10 @@ class LoraLayer(BaseTunerLayer):
 
         # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
         if isinstance(init_lora_weights, str) and init_lora_weights.startswith("daniel"):
-            with gather_params_ctx(self.get_base_layer().weight):
+            with gather_params_ctx(self.get_base_layer().dequantize_weight()):
                 self.daniel_init(adapter_name, init_lora_weights)
-        if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
+            print("Init layer adapter with daniel")
+        elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
             with gather_params_ctx(self.get_base_layer().weight):
                 self.pissa_init(adapter_name, init_lora_weights)
         elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("corda"):
@@ -281,65 +283,129 @@ class LoraLayer(BaseTunerLayer):
                 # embeddings are not supported at the moment, but still adding this for consistency
                 nn.init.zeros_(self.lora_embedding_B[adapter_name].bias)
 
+    def transpose(weight, fan_in_fan_out):
+        return weight.T if fan_in_fan_out else weight
+
+    def svd_lowrank(matrix, rank, niter=2):
+        # Platzhalter, ersetze ihn durch deine echte Implementierung
+        U, S, Vh = torch.linalg.svd(matrix, full_matrices=False)
+        return U, S, Vh.T
+
+    # ------------------------------------
+
     def daniel_init(self, adapter_name, init_lora_weights):
-            weight = self.get_base_layer().weight
-            dtype = weight.dtype
-            if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
-                raise TypeError(
-                    "Please initialize Daniel's method under float32, float16, or bfloat16. "
-                    "Subsequently, re-quantize the residual model to help minimize quantization errors."
-                )
+        """
+        Initialisiert LoRA-Adapter A und B robust via SVD (PiSSA-Methode),
+        indem die korrekten Dimensionen aus den Ziel-Layern abgeleitet werden.
+        """
+        # 1. Leite die wahren Dimensionen aus den LoRA-Layern ab
+        # self.lora_B[...].weight hat die Form (out_features, r)
+        # self.lora_A[...].weight hat die Form (r, in_features)
+        out_features = self.lora_B[adapter_name].weight.shape[0]
+        in_features = self.lora_A[adapter_name].weight.shape[1]
+        rank = self.r[adapter_name]
 
-            # W = weight matrix, transpose if needed
-            W = transpose(weight.to(torch.float32), self.fan_in_fan_out)
+        # 2. Hole die Gewichte und prüfe die Form
+        weight = self.get_base_layer().original_weight_fp32.clone().to(torch.float32)
+        weight_for_svd = weight.clone().to(torch.float32)
+        print(weight_for_svd.shape)
+        # weight_for_svd = weight_for_svd.T
 
-            # Get dimensions
-            D_out, D_in = W.shape  # W is (output_dim, input_dim)
-            r = self.r[adapter_name]  # rank
+        # 4. Führe SVD auf der korrekt ausgerichteten Matrix durch
+        if init_lora_weights == "daniel":
+            U, S, Vh = torch.linalg.svd(weight_for_svd.data, full_matrices=False)
+        elif "niter" in init_lora_weights:
+            U, S, V = svd_lowrank(weight_for_svd.data, rank, niter=int(init_lora_weights.split("_niter_")[-1]))
+            Vh = V.t()
+        else:
+            raise ValueError(f"Unknown init_lora_weights: {init_lora_weights}")
 
-            if init_lora_weights == "daniel":
-                # Full SVD: W = U @ S @ V^T
-                U, S, Vh = torch.linalg.svd(W.data, full_matrices=False)
-                V = Vh.t()  # Convert V^T to V
+        # 5. Berechne LoRA A und B
+        # Dimensionen sind jetzt garantiert korrekt:
+        # Ur: (out_features, r), Sr: (r,), Vhr: (r, in_features)
+        Ur = U[:, :rank]
+        Sr = S[:rank]
+        Vhr = Vh[:rank, :]
 
-                # Cut to rank r
-                U_r = U[:, :r]  # (D_out, r)
-                S_r = S[:r]  # (r,)
-                V_r = V[:, :r]  # (D_in, r)
+        Sr_scaled = Sr / self.scaling[adapter_name]
+        sqrt_Sr = torch.sqrt(Sr_scaled)
 
-            elif len(init_lora_weights.split("_niter_")) == 2:
-                # Fast SVD with specified iterations
-                niter = int(init_lora_weights.split("_niter_")[-1])
-                U_r, S_r, V_r_t = svd_lowrank(W.data, r, niter=niter)
-                V_r = V_r_t.t()  # Convert V^T to V: (D_in, r)
+        # lora_A: (r, r) @ (r, in_features) -> (r, in_features)
+        # lora_B: (out_features, r) @ (r, r) -> (out_features, r)
+        lora_A = torch.diag(sqrt_Sr) @ Vhr
+        lora_B = Ur @ torch.diag(sqrt_Sr)
 
-            else:
-                raise ValueError(
-                    f"init_lora_weights should be 'daniel' or 'daniel_niter_[number of iters]', got {init_lora_weights} instead."
-                )
+        # 6. Weise die neuen Gewichte zu (die Formen müssen jetzt passen)
+        self.lora_A[adapter_name].weight.data = lora_A.to(self.lora_A[adapter_name].weight.dtype)
+        self.lora_B[adapter_name].weight.data = lora_B.to(self.lora_B[adapter_name].weight.dtype)
 
-            # Apply scaling factor
-            S_r /= self.scaling[adapter_name]
+        # 7. Aktualisiere die ursprüngliche Gewichtsmatrix
+        residual = self.scaling[adapter_name] * (lora_B @ lora_A)
+        weight_updated = weight_for_svd.data - residual
 
-            # Create US = U @ diag(S) - multiply S into U
-            US = U_r @ torch.diag(S_r)  # (D_out, r)
+        # 8. Bringe die aktualisierten Gewichte zurück in ihre Originalform und quantisiere sie
+        # Wenn wir am Anfang transponiert haben, müssen wir hier zurück transponieren.
+        # if weight_updated.shape != weight.shape:
+        weight_updated = weight_updated.T
 
-            # Set LoRA weights according to your specification:
-            # lora_A corresponds to US: (r, D_in) - need to transpose US
-            # lora_B corresponds to V: (D_out, r) - need to transpose V_r
-            self.lora_A[adapter_name].weight.data = US.t()  # (r, D_in)
-            self.lora_B[adapter_name].weight.data = V_r.t()  # (r, D_out) -> transposed to (D_out, r)
+        # self.base_layer.quantize_to_int(weight_updated.to(weight.dtype))
 
-            # Update base weight: W_new = W - scaling * lora_B @ lora_A
-            # Note: lora_B @ lora_A = V_r.t().t() @ US.t() = V_r @ US.t() = V_r @ (U_r @ diag(S_r)).t()
-            #                       = V_r @ diag(S_r) @ U_r.t()
-            delta_weight = self.scaling[adapter_name] * (V_r @ torch.diag(S_r) @ U_r.t())
-            weight_new = W.data - delta_weight
+    def daniel_init_working_but_bad_starting_loss(self, adapter_name, init_lora_weights):
+        """
+        Initialisiert LoRA-Adapter A und B robust via SVD (PiSSA-Methode),
+        indem die korrekten Dimensionen aus den Ziel-Layern abgeleitet werden.
+        """
+        # 1. Leite die wahren Dimensionen aus den LoRA-Layern ab
+        # self.lora_B[...].weight hat die Form (out_features, r)
+        # self.lora_A[...].weight hat die Form (r, in_features)
+        out_features = self.lora_B[adapter_name].weight.shape[0]
+        in_features = self.lora_A[adapter_name].weight.shape[1]
+        rank = self.r[adapter_name]
 
-            # Convert back to original dtype and transpose if needed
-            weight_new = transpose(weight_new.to(dtype), self.fan_in_fan_out)
-            self.get_base_layer().weight.data = weight_new
+        # 2. Hole die Gewichte und prüfe die Form
+        weight = self.get_base_layer().dequantize_weight()
+        weight_for_svd = weight.clone().to(torch.float32)
+        print(weight_for_svd.shape)
+        weight_for_svd = weight_for_svd.T
 
+        # 4. Führe SVD auf der korrekt ausgerichteten Matrix durch
+        if init_lora_weights == "daniel":
+            U, S, Vh = torch.linalg.svd(weight_for_svd.data, full_matrices=False)
+        elif "niter" in init_lora_weights:
+            U, S, V = svd_lowrank(weight_for_svd.data, rank, niter=int(init_lora_weights.split("_niter_")[-1]))
+            Vh = V.t()
+        else:
+            raise ValueError(f"Unknown init_lora_weights: {init_lora_weights}")
+
+        # 5. Berechne LoRA A und B
+        # Dimensionen sind jetzt garantiert korrekt:
+        # Ur: (out_features, r), Sr: (r,), Vhr: (r, in_features)
+        Ur = U[:, :rank]
+        Sr = S[:rank]
+        Vhr = Vh[:rank, :]
+
+        Sr_scaled = Sr / self.scaling[adapter_name]
+        sqrt_Sr = torch.sqrt(Sr_scaled)
+
+        # lora_A: (r, r) @ (r, in_features) -> (r, in_features)
+        # lora_B: (out_features, r) @ (r, r) -> (out_features, r)
+        lora_A = torch.diag(sqrt_Sr) @ Vhr
+        lora_B = Ur @ torch.diag(sqrt_Sr)
+
+        # 6. Weise die neuen Gewichte zu (die Formen müssen jetzt passen)
+        self.lora_A[adapter_name].weight.data = lora_A.to(self.lora_A[adapter_name].weight.dtype)
+        self.lora_B[adapter_name].weight.data = lora_B.to(self.lora_B[adapter_name].weight.dtype)
+
+        # 7. Aktualisiere die ursprüngliche Gewichtsmatrix
+        residual = self.scaling[adapter_name] * (lora_B @ lora_A)
+        weight_updated = weight_for_svd.data - residual
+
+        # 8. Bringe die aktualisierten Gewichte zurück in ihre Originalform und quantisiere sie
+        # Wenn wir am Anfang transponiert haben, müssen wir hier zurück transponieren.
+        # if weight_updated.shape != weight.shape:
+        weight_updated = weight_updated.T
+
+        self.base_layer.quantize_to_int(weight_updated.to(weight.dtype))
 
     def olora_init(self, adapter_name):
         base_layer = self.get_base_layer()
@@ -385,9 +451,9 @@ class LoraLayer(BaseTunerLayer):
         else:
             weight_tensor = weight_tensor.to(dtype)
             base_layer.weight.data = weight_tensor
-            
 
     def pissa_init(self, adapter_name, init_lora_weights):
+        original_weight = self.get_base_layer().weight.data.clone()
         weight = self.get_base_layer().weight
         dtype = weight.dtype
         if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
@@ -421,6 +487,41 @@ class LoraLayer(BaseTunerLayer):
         weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_A
         weight = transpose(weight.to(dtype), self.fan_in_fan_out)
         self.get_base_layer().weight.data = weight
+
+        print("--- Verifying PiSSA Implementation ---")
+
+        # Reconstruct the weight: W' = W_res + lora_B @ lora_A
+        # We use the float32 versions for an accurate comparison
+        reconstructed_weight_float32 = transpose(
+            self.get_base_layer().weight.data.to(torch.float32), self.fan_in_fan_out
+        ) + self.scaling[adapter_name] * (lora_B @ lora_A)
+
+        # --- Error Calculation and Reporting ---
+        # Calculate the difference between the original and reconstructed matrices
+        error = original_weight - reconstructed_weight_float32
+
+        # Absolute Error Metrics
+        abs_error = torch.abs(error)
+        mean_abs_error = torch.mean(abs_error).item()
+        max_abs_error = torch.max(abs_error).item()
+
+        # Relative Error Metrics
+        # Add a small epsilon to the denominator to prevent division by zero for weights that are 0
+        relative_error = torch.abs(error) / (torch.abs(original_weight) + 1e-9)
+        mean_rel_error = torch.mean(relative_error).item()
+
+        print(f"Mean Absolute Error: {mean_abs_error:.4e}")
+        print(f"Max Absolute Error:  {max_abs_error:.4e}")
+        print(f"Mean Relative Error: {mean_rel_error:.4e}")
+
+        # The final assertion check
+        try:
+            # Use a reasonable tolerance. SVD on float32 isn't perfect.
+            assert torch.allclose(original_weight, reconstructed_weight_float32.to(dtype), atol=1e-3)
+            print("\n✅ Assertion Passed: Reconstruction is correct within tolerance.")
+        except AssertionError:
+            print(f"\n❌ Assertion Failed: Reconstruction error ({max_abs_error:.4e}) exceeds tolerance.")
+        print("------------------------------------")
 
     def corda_init(self, adapter_name, init_lora_weights):
         linear = self.get_base_layer()
@@ -1989,6 +2090,9 @@ class ParamWrapper(nn.Module, LoraLayer):
         elif init_lora_weights == "orthogonal":
             with gather_params_ctx(self.get_base_layer().weight):
                 self.orthogonal_init(adapter_name)
+        # elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("daniel"):
+        #     with gather_params_ctx(self.get_base_layer().dequantize_weight()):
+        #         self.daniel_init(adapter_name)
         elif init_lora_weights:
             self.reset_lora_parameters(adapter_name, init_lora_weights)
         # call this before init of the lora variants

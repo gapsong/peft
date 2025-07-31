@@ -14,6 +14,8 @@
 
 import copy
 import os
+import numpy as np
+import random
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
@@ -67,6 +69,8 @@ class TrainingArguments(transformers.TrainingArguments):
     dataset_split: str = field(default="train[:100000]", metadata={"help": "(`['train', 'test', 'eval']`):"})
     dataset_field: list[str] = field(default=None, metadata={"help": "Fields of dataset input and output."})
     dataloader_num_proc: int = field(default=16, metadata={"help": "Number of processes to load dataset"})
+    bits: int = field(default=4, metadata={"help": "Number of bits to quantize the model. Default is 4."})
+
     dataloader_batch_size: int = field(
         default=3000,
         metadata={
@@ -96,6 +100,7 @@ class TrainingArguments(transformers.TrainingArguments):
         default=4,
         metadata={"help": "Number of iterations for PiSSA initialization."},
     )
+    seed: int = field(default=42, metadata={"help": "Random seed for reproducibility"})
     # Keep legacy flags for backwards compatibility
     corda_mode: bool = field(default=None, metadata={"help": "Deprecated: use --training_mode=corda instead"})
     use_qalora: bool = field(default=None, metadata={"help": "Deprecated: use --training_mode=qalora instead"})
@@ -206,6 +211,7 @@ def load_or_quantize_model(
     Args:
         base_model: Model identifier or path
         tokenizer: Tokenizer for the model
+        qalora_group_size: Group size for quantization (default: 32)
         bits: Bit-width for quantization (default: 4)
         cache_dir: Directory to store quantized models
 
@@ -234,30 +240,39 @@ def load_or_quantize_model(
             print(f"✅ Model {base_model} is already GPTQ-quantized. Using directly.")
             return test_model
         else:
-            print(f"Model {base_model} is not GPTQ-quantized. Will quantize it.")
-            # Clean up the test model to free memory
+            print(f"Model {base_model} is not GPTQ-quantized. Will quantize it with {bits}-bit.")
+            # Clen up the test model to free memory
             del test_model
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     except Exception as e:
         print(f"Could not load model {base_model} directly: {e}")
-        print("Will attempt to quantize it...")
+        print(f"Will attempt to quantize it with {bits}-bit...")
 
     # If we get here, the model needs to be quantized
     os.makedirs(cache_dir, exist_ok=True)
     model_id = base_model.replace("/", "_").replace("\\", "_")  # Handle Windows paths too
     quantized_model_path = os.path.join(cache_dir, f"{model_id}_gptq_{bits}bit_groupsize_{qalora_group_size}")
 
-    # Check if we already have a cached quantized version
+    # Check if we already have a cached quantized version with the exact same settings
     if os.path.exists(quantized_model_path) and os.path.exists(os.path.join(quantized_model_path, "config.json")):
         print(f"Loading pre-quantized model from cache: {quantized_model_path}")
-        return AutoModelForCausalLM.from_pretrained(quantized_model_path, device_map="auto")
+        try:
+            return AutoModelForCausalLM.from_pretrained(quantized_model_path, device_map="auto")
+        except Exception as e:
+            print(f"Failed to load cached model: {e}")
+            print("Will re-quantize the model...")
+            import shutil
 
-    print(f"Quantizing model and saving to cache: {quantized_model_path}")
+            shutil.rmtree(quantized_model_path)  # Remove corrupted cache
 
-    # Configure GPTQ for first-time quantization
+    print(
+        f"Quantizing model with {bits}-bit and group size {qalora_group_size}, saving to cache: {quantized_model_path}"
+    )
+
+    # Configure GPTQ for first-time quantization with the specified bits
     gptq_config = GPTQConfig(
-        bits=bits,
+        bits=bits,  # Use the bits parameter from function arguments
         dataset="c4",
         tokenizer=tokenizer,
         group_size=qalora_group_size,
@@ -266,15 +281,17 @@ def load_or_quantize_model(
     )
 
     # Load and quantize the model
+    print(f"Loading model for {bits}-bit quantization...")
     model = AutoModelForCausalLM.from_pretrained(
         base_model, device_map="auto", quantization_config=gptq_config, torch_dtype=torch.float16
     )
 
     # Save the quantized model to cache
-    print(f"Saving quantized model to {quantized_model_path}")
+    print(f"Saving {bits}-bit quantized model to {quantized_model_path}")
     model.save_pretrained(quantized_model_path)
     tokenizer.save_pretrained(quantized_model_path)
 
+    print(f"✅ Model quantized to {bits}-bit with group size {qalora_group_size} and cached successfully")
     return model
 
 
@@ -297,8 +314,19 @@ def train():
     script_args = parser.parse_args_into_dataclasses()[0]
     print(script_args)
 
+    # --- ADD THIS BLOCK ---
+    # Set seed before initializing model.
+    print(f"Setting random seed to {script_args.seed}")
+    random.seed(script_args.seed)
+    np.random.seed(script_args.seed)
+    torch.manual_seed(script_args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(script_args.seed)
+        # --- END OF BLOCK ---
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     # Validate training mode
-    valid_modes = ["full", "lora", "qlora", "qalora", "pissa", "corda"]
+    valid_modes = ["full", "lora", "qlora", "qalora", "pissa", "corda", "daniel"]
     if script_args.training_mode not in valid_modes:
         raise ValueError(f"Invalid training_mode '{script_args.training_mode}'. Must be one of: {valid_modes}")
 
@@ -328,7 +356,10 @@ def train():
     elif script_args.training_mode == "qalora":
         print("🔧 Setting up QA-LoRA training...")
         model = load_or_quantize_model(
-            script_args.model_name_or_path, tokenizer, qalora_group_size=script_args.qalora_group_size, bits=4
+            script_args.model_name_or_path,
+            tokenizer,
+            qalora_group_size=script_args.qalora_group_size,
+            bits=script_args.bits,
         )
 
         lora_config = LoraConfig(
@@ -431,7 +462,97 @@ def train():
             torch_dtype=torch.bfloat16,
             device_map="auto",
         )
+    elif script_args.training_mode == "daniel_old":
+        print("🔧 Setting up QA-LoRA training...")
+        model = load_or_quantize_model(
+            script_args.model_name_or_path,
+            tokenizer,
+            qalora_group_size=script_args.qalora_group_size,
+            bits=script_args.bits,
+        )
 
+        lora_config = LoraConfig(
+            task_type="CAUSAL_LM",
+            use_qalora=True,
+            qalora_group_size=script_args.qalora_group_size,
+            r=script_args.lora_r,
+            lora_alpha=2 * script_args.lora_r,
+            target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            init_lora_weights="daniel",  # PiSSA initialization
+        )
+
+        model = get_peft_model(model, lora_config)
+    elif script_args.training_mode == "daniel":
+        print("🔧 Setting up QA-LoRA training with PiSSA initialization...")
+
+        # =================================================================================
+        # PHASE 1: Sichern der originalen FP32-Gewichte
+        # =================================================================================
+        print("Phase 1: Lade das originale FP32-Modell zum Cachen der Gewichte...")
+        # Lade das hochpräzise Originalmodell
+        fp32_model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path)
+
+        # Definiere die Zielmodule hier, damit wir wissen, welche Gewichte wir speichern müssen
+        target_modules = ["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"]
+
+        # Erstelle eine Map, die Layernamen auf ihre FP32-Gewichte abbildet
+        fp32_weights_map = {
+            name: module.weight.clone().to(torch.float32)
+            for name, module in fp32_model.named_modules()
+            # Speichere nur die Gewichte, die wir für PiSSA brauchen werden
+            if any(target_module in name for target_module in target_modules)
+        }
+
+        print(f"  -> {len(fp32_weights_map)} FP32-Gewichtsmatrizen für Ziel-Layer gecached.")
+
+        # Gib den Speicher des großen FP32-Modells sofort frei
+        del fp32_model
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # =================================================================================
+        # PHASE 2: Modell laden/quantisieren und Gewichte anheften
+        # =================================================================================
+        print("\nPhase 2: Lade oder quantisiere das Hauptmodell...")
+        model = load_or_quantize_model(
+            script_args.model_name_or_path,
+            tokenizer,
+            qalora_group_size=script_args.qalora_group_size,
+            bits=script_args.bits,
+        )
+        print("  -> Modell geladen/quantisiert.")
+
+        print("\nPhase 3: Hänge die gecachten FP32-Gewichte an die quantisierten Layer an...")
+        # Iteriere durch die Layer des *quantisierten* Modells
+        for name, module in model.named_modules():
+            if name in fp32_weights_map:
+                # Hänge das gecachte FP32-Gewicht als neues Attribut an den Layer an.
+                # Ihre `daniel_init` Funktion wird nach diesem Attribut suchen.
+                module.original_weight_fp32 = fp32_weights_map[name].to(module.qweight.device)
+                print(f"  - Originalgewicht für '{name}' erfolgreich angehängt.")
+
+        # =================================================================================
+        # PHASE 3: PEFT-Setup mit PiSSA (Ihr ursprünglicher Code)
+        # =================================================================================
+        print("\nPhase 4: Richte PEFT mit PiSSA-Initialisierung ein...")
+        lora_config = LoraConfig(
+            task_type="CAUSAL_LM",
+            use_qalora=True,
+            qalora_group_size=script_args.qalora_group_size,
+            r=script_args.lora_r,
+            lora_alpha=2 * script_args.lora_r,
+            target_modules=target_modules,  # Wiederverwendung der oben definierten Liste
+            lora_dropout=0.05,
+            bias="none",
+            init_lora_weights="daniel_niter_5",  # WICHTIG: Stellen Sie sicher, dass Sie hier die Anzahl der Iterationen angeben
+        )
+
+        model = get_peft_model(model, lora_config)
+        print("  -> PEFT-Modell erfolgreich erstellt. PiSSA-Initialisierung wird beim Trainingsstart ausgelöst.")
     else:
         raise ValueError(f"Unknown training mode: {script_args.training_mode}")
 
