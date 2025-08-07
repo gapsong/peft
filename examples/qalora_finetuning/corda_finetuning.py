@@ -455,6 +455,63 @@ def train():
 
         print(f"✅ QLoRA model loaded with 4-bit quantization")
 
+    elif script_args.training_mode == "pissa_rank_analysis":
+        print("🔧 Setting up rank analysis with quantization...")
+
+        # Phase 1: Cache FP32 weights (wie vorher)
+        print("Phase 1: Lade das originale FP32-Modell zum Cachen der Gewichte...")
+        model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path)
+        target_modules = ["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"]
+
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+        lora_config = LoraConfig(
+            task_type="CAUSAL_LM",
+            r=script_args.lora_r,
+            lora_alpha=2 * script_args.lora_r,
+            target_modules=target_modules,
+            lora_dropout=0.05,
+            bias="none",
+            init_lora_weights="daniel",  # Use a specific init for rank analysis
+        )
+
+        from gptqmodel import GPTQModel
+        from gptqmodel.quantization import QuantizeConfig
+
+        peft_model = get_peft_model(model, lora_config)  # Adapter model with LoRA config
+
+        base_model = model.base_model
+        base_model.save_pretrained(os.path.join(script_args.output_dir, "ft", "base_model"))
+
+        # add in here different quantization configs for different bits from 1 to 4
+        bits = 4
+        # Configure GPTQ for first-time quantization with the specified bits
+        gptq_config = GPTQConfig(
+            bits=script_args.bits,  # Use the bits parameter from function arguments
+            dataset="c4",
+            tokenizer=tokenizer,
+            group_size=32,
+            desc_act=False,
+            sym=False,
+            static_groups=False,  # +2-5% quality
+            true_sequential=True,  # +1-3% quality
+            actorder=True,  # +3-7% quality
+        )
+
+        # Load and quantize the model
+        print(f"Loading model for {bits}-bit quantization...")
+        quantized_model = AutoModelForCausalLM.from_pretrained(
+            os.path.join(script_args.output_dir, "ft", "base_model"), device_map="auto", quantization_config=gptq_config, torch_dtype=torch.float16
+        )
+
+        # Step 5: Re-apply PEFT to quantized model
+        peft_model.base_model.model = quantized_model
+        peft_model.base_model.model = prepare_model_for_kbit_training(
+            peft_model.base_model.model,
+            use_gradient_checkpointing=True
+        )
+        print(f"✅ QLoRA model loaded with 4-bit quantization and FP32 weights attached for rank analysis")
+
     elif script_args.training_mode == "full":
         print("🔧 Setting up full finetuning...")
         model = transformers.AutoModelForCausalLM.from_pretrained(
