@@ -228,7 +228,7 @@ class LoraLayer(BaseTunerLayer):
 
         # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
         if isinstance(init_lora_weights, str) and init_lora_weights.startswith("daniel"):
-            with gather_params_ctx(self.get_base_layer().dequantize_weight()):
+            with gather_params_ctx(self.get_base_layer().weight):
                 self.daniel_init(adapter_name, init_lora_weights)
             print("Init layer adapter with daniel")
         elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
@@ -306,7 +306,7 @@ class LoraLayer(BaseTunerLayer):
         rank = self.r[adapter_name]
 
         # 2. Hole die Gewichte und prüfe die Form
-        weight = self.get_base_layer().original_weight_fp32.clone().to(torch.float32)
+        weight = self.get_base_layer().weight.clone().to(torch.float32)
         weight_for_svd = weight.clone().to(torch.float32)
         print(weight_for_svd.shape)
         # weight_for_svd = weight_for_svd.T
@@ -348,7 +348,8 @@ class LoraLayer(BaseTunerLayer):
         # if weight_updated.shape != weight.shape:
         weight_updated = weight_updated.T
 
-        # self.base_layer.quantize_to_int(weight_updated.to(weight.dtype))
+        self.get_base_layer().weight.data = weight_updated
+
 
     def daniel_init_working_but_bad_starting_loss(self, adapter_name, init_lora_weights):
         """

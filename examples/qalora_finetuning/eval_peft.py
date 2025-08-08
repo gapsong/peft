@@ -4,14 +4,17 @@ Evaluation script for PEFT models using lm-eval-harness.
 """
 
 import argparse
-import os
-import torch
 import json
+import os
+
+import datasets
 import lm_eval
+import torch
 from lm_eval.models.huggingface import HFLM
 from transformers import AutoModelForCausalLM, AutoTokenizer, GPTQConfig
+from gptqmodel import GPTQModel
 from peft import PeftModel
-import datasets
+
 
 datasets.config.HF_DATASETS_TRUST_REMOTE_CODE = True
 
@@ -165,7 +168,6 @@ def main():
     parser.add_argument("--test_generation", action="store_true", help="Test model generation before evaluation")
     parser.add_argument("--apply_gptq_post_quant", action="store_true", help="Quantize model with GPTQ after loading")
     parser.add_argument("--bits", type=int, default=4, help="Limit number of samples (for testing)")
-
 
     args = parser.parse_args()
 

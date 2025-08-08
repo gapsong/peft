@@ -14,16 +14,17 @@
 
 import copy
 import os
-import numpy as np
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
-
+import datetime
+import numpy as np
 import torch
 import transformers
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, GPTQConfig, Trainer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig, GPTQConfig, Trainer
+
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 
 
@@ -326,7 +327,7 @@ def train():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     # Validate training mode
-    valid_modes = ["full", "lora", "qlora", "qalora", "pissa", "corda", "daniel"]
+    valid_modes = ["full", "lora", "qlora", "qalora", "pissa", "corda", "daniel", "pissa_rank_analysis", "daniel_old"]
     if script_args.training_mode not in valid_modes:
         raise ValueError(f"Invalid training_mode '{script_args.training_mode}'. Must be one of: {valid_modes}")
 
@@ -379,6 +380,7 @@ def train():
         print("🔧 Setting up PiSSA training...")
         model = transformers.AutoModelForCausalLM.from_pretrained(
             script_args.model_name_or_path,
+            # torch_dtype=torch.bfloat16,
             device_map="auto",
         )
 
@@ -456,10 +458,10 @@ def train():
         print(f"✅ QLoRA model loaded with 4-bit quantization")
 
     elif script_args.training_mode == "pissa_rank_analysis":
-        print("🔧 Setting up rank analysis with quantization...")
+        print("🔧 Setting up rank analysis with multiple quantization configurations...")
 
-        # Phase 1: Cache FP32 weights (wie vorher)
-        print("Phase 1: Lade das originale FP32-Modell zum Cachen der Gewichte...")
+        # Phase 1: Setup base model and PEFT
+        print("Phase 1: Loading original model and setting up PEFT...")
         model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path)
         target_modules = ["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"]
 
@@ -472,46 +474,197 @@ def train():
             target_modules=target_modules,
             lora_dropout=0.05,
             bias="none",
-            init_lora_weights="daniel",  # Use a specific init for rank analysis
+            init_lora_weights="daniel",
         )
 
-        from gptqmodel import GPTQModel
-        from gptqmodel.quantization import QuantizeConfig
+        peft_model = get_peft_model(model, lora_config)
+        print("✅ PEFT model with daniel initialization complete")
 
-        peft_model = get_peft_model(model, lora_config)  # Adapter model with LoRA config
+        # Phase 2: Extract base model (with residual weights after daniel_init)
+        base_model = peft_model.get_base_model()
 
-        base_model = model.base_model
-        base_model.save_pretrained(os.path.join(script_args.output_dir, "ft", "base_model"))
+        # Create base directory structure
+        model_name_clean = script_args.model_name_or_path.replace("/", "_").replace("\\", "_")
+        base_output_dir = os.path.join(script_args.output_dir, "quantized_residuals")
+        os.makedirs(base_output_dir, exist_ok=True)
 
-        # add in here different quantization configs for different bits from 1 to 4
-        bits = 4
-        # Configure GPTQ for first-time quantization with the specified bits
-        gptq_config = GPTQConfig(
-            bits=script_args.bits,  # Use the bits parameter from function arguments
-            dataset="c4",
-            tokenizer=tokenizer,
-            group_size=32,
-            desc_act=False,
-            sym=False,
-            static_groups=False,  # +2-5% quality
-            true_sequential=True,  # +1-3% quality
-            actorder=True,  # +3-7% quality
+        # Phase 3: Save adapter (this contains the LoRA matrices from daniel_init)
+        adapter_name = f"daniel_adapter_r{script_args.lora_r}_{model_name_clean}"
+        adapter_path = os.path.join(base_output_dir, adapter_name)
+        print(f"Saving daniel adapter to: {adapter_path}")
+        peft_model.save_pretrained(adapter_path)
+
+        # Phase 4: Quantize W_res with different bit configurations
+        quantization_configs = [
+            {"bits": 2, "group_size": 32},
+            {"bits": 3, "group_size": 32},
+            {"bits": 4, "group_size": 32},
+            {"bits": 4, "group_size": 64},  # Different group size for comparison
+            {"bits": 4, "group_size": 128},
+        ]
+
+        # Save the residual base model temporarily
+        temp_residual_path = os.path.join(base_output_dir, "temp_residual_base")
+        base_model.save_pretrained(temp_residual_path)
+
+        quantized_models_info = []
+
+        for i, qconfig in enumerate(quantization_configs):
+            bits = qconfig["bits"]
+            group_size = qconfig["group_size"]
+
+            print(f"\n{'=' * 60}")
+            print(f"Quantizing W_res [{i + 1}/{len(quantization_configs)}]: {bits}-bit, group_size={group_size}")
+            print(f"{'=' * 60}")
+
+            # Create unique name for this quantization
+            quantized_name = f"w_res_{model_name_clean}_r{script_args.lora_r}_daniel_{bits}bit_gs{group_size}"
+            quantized_path = os.path.join(base_output_dir, quantized_name)
+
+            # Skip if already exists
+            if os.path.exists(quantized_path) and os.path.exists(os.path.join(quantized_path, "config.json")):
+                print(f"⏭️  Quantized model already exists: {quantized_path}")
+                quantized_models_info.append(
+                    {
+                        "bits": bits,
+                        "group_size": group_size,
+                        "quantized_path": quantized_path,
+                        "adapter_path": adapter_path,
+                        "status": "exists",
+                    }
+                )
+                continue
+
+            try:
+                # Configure GPTQ with current settings
+                gptq_config = GPTQConfig(
+                    bits=bits,
+                    dataset="c4",
+                    tokenizer=tokenizer,
+                    group_size=group_size,
+                    desc_act=False,
+                    sym=False,
+                    static_groups=False,
+                    true_sequential=True,
+                    actorder=True,
+                )
+
+                print(f"Loading residual model for {bits}-bit quantization...")
+                quantized_model = AutoModelForCausalLM.from_pretrained(
+                    temp_residual_path, device_map="auto", quantization_config=gptq_config, torch_dtype=torch.float16
+                )
+
+                print(f"Saving {bits}-bit quantized W_res to: {quantized_path}")
+                quantized_model.save_pretrained(quantized_path)
+                tokenizer.save_pretrained(quantized_path)
+
+                # Save metadata about this quantization
+                metadata = {
+                    "base_model": script_args.model_name_or_path,
+                    "lora_rank": script_args.lora_r,
+                    "lora_alpha": 2 * script_args.lora_r,
+                    "initialization": "daniel",
+                    "quantization": {
+                        "bits": bits,
+                        "group_size": group_size,
+                        "desc_act": False,
+                        "sym": False,
+                        "static_groups": False,
+                        "true_sequential": True,
+                        "actorder": True,
+                    },
+                    "target_modules": target_modules,
+                    "adapter_path": adapter_path,
+                }
+
+                with open(os.path.join(quantized_path, "quantization_metadata.json"), "w") as f:
+                    import json
+
+                    json.dump(metadata, f, indent=2)
+
+                quantized_models_info.append(
+                    {
+                        "bits": bits,
+                        "group_size": group_size,
+                        "quantized_path": quantized_path,
+                        "adapter_path": adapter_path,
+                        "status": "created",
+                    }
+                )
+
+                # Clean up memory
+                del quantized_model
+                torch.cuda.empty_cache()
+
+                print(f"✅ {bits}-bit quantization complete!")
+
+            except Exception as e:
+                print(f"❌ Failed to quantize with {bits}-bit, group_size={group_size}: {e}")
+                quantized_models_info.append(
+                    {
+                        "bits": bits,
+                        "group_size": group_size,
+                        "quantized_path": None,
+                        "adapter_path": adapter_path,
+                        "status": "failed",
+                        "error": str(e),
+                    }
+                )
+                continue
+
+        # Phase 5: Save summary of all quantized models
+        summary = {
+            "base_model": script_args.model_name_or_path,
+            "lora_config": {
+                "r": script_args.lora_r,
+                "alpha": 2 * script_args.lora_r,
+                "target_modules": target_modules,
+                "initialization": "daniel",
+            },
+            "adapter_path": adapter_path,
+            "quantized_models": quantized_models_info,
+            "total_created": len([x for x in quantized_models_info if x["status"] == "created"]),
+            "total_existing": len([x for x in quantized_models_info if x["status"] == "exists"]),
+            "total_failed": len([x for x in quantized_models_info if x["status"] == "failed"]),
+        }
+
+        summary_path = os.path.join(
+            base_output_dir, f"quantization_summary_r{script_args.lora_r}_{model_name_clean}.json"
         )
+        with open(summary_path, "w") as f:
+            import json
 
-        # Load and quantize the model
-        print(f"Loading model for {bits}-bit quantization...")
-        quantized_model = AutoModelForCausalLM.from_pretrained(
-            os.path.join(script_args.output_dir, "ft", "base_model"), device_map="auto", quantization_config=gptq_config, torch_dtype=torch.float16
-        )
+            json.dump(summary, f, indent=2)
 
-        # Step 5: Re-apply PEFT to quantized model
-        peft_model.base_model.model = quantized_model
-        peft_model.base_model.model = prepare_model_for_kbit_training(
-            peft_model.base_model.model,
-            use_gradient_checkpointing=True
-        )
-        print(f"✅ QLoRA model loaded with 4-bit quantization and FP32 weights attached for rank analysis")
+        # Cleanup temporary files
+        import shutil
 
+        shutil.rmtree(temp_residual_path)
+
+        print(f"\n{'=' * 60}")
+        print("🎉 QUANTIZATION SUMMARY")
+        print(f"{'=' * 60}")
+        print(f"Base model: {script_args.model_name_or_path}")
+        print(f"LoRA rank: {script_args.lora_r}")
+        print(f"Adapter saved to: {adapter_path}")
+        print(f"Created: {summary['total_created']} quantized models")
+        print(f"Existing: {summary['total_existing']} quantized models")
+        print(f"Failed: {summary['total_failed']} quantizations")
+        print(f"Summary saved to: {summary_path}")
+        print("\nQuantized models:")
+        for info in quantized_models_info:
+            status_emoji = {"created": "✅", "exists": "⏭️", "failed": "❌"}[info["status"]]
+            print(f"  {status_emoji} {info['bits']}-bit (gs={info['group_size']}) -> {info['quantized_path']}")
+
+        # Set model to one of the quantized versions for potential continued training
+        if quantized_models_info and quantized_models_info[0]["quantized_path"]:
+            print(f"\nLoading 4-bit quantized model for training continuation...")
+            four_bit_model = [x for x in quantized_models_info if x["bits"] == 4 and x["group_size"] == 32]
+            if four_bit_model:
+                model = AutoModelForCausalLM.from_pretrained(
+                    four_bit_model[0]["quantized_path"], device_map="auto", torch_dtype=torch.float16
+                )
+                model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     elif script_args.training_mode == "full":
         print("🔧 Setting up full finetuning...")
         model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -639,9 +792,9 @@ def train():
         "train_dataset": train_dataset,
         "data_collator": data_collator,
     }
-    trainer = Trainer(model=model, tokenizer=tokenizer, args=script_args, **data_module)
-    trainer.train()
-    trainer.save_state()
+    # trainer = Trainer(model=model, tokenizer=tokenizer, args=script_args, **data_module)
+    # trainer.train()
+    # trainer.save_state()
     model.save_pretrained(os.path.join(script_args.output_dir, "ft"))
     tokenizer.save_pretrained(os.path.join(script_args.output_dir, "ft"))
 

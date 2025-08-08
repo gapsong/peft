@@ -13,7 +13,7 @@ NUM_EPOCHS=2
 MAX_LENGTH=2048
 
 # Training mode selection
-TRAINING_MODE="qalora"  # Options: full, lora, qlora, qalora, pissa, corda
+TRAINING_MODE="pissa"  # Options: full, lora, qlora, qalora, pissa, corda
 LORA_R=4
 QALORA_GROUP_SIZE=32
 PISSA_NITER=4
@@ -89,7 +89,8 @@ python corda_finetuning.py \
     --bf16="$BF16" \
     --dataloader_pin_memory="$DATALOADER_PIN_MEMORY" \
     --remove_unused_columns="$REMOVE_UNUSED_COLUMNS" \
-    --report_to="$REPORT_TO"
+    --report_to="$REPORT_TO" \
+    --bits="2"
 
 if [ $? -ne 0 ]; then
     echo "❌ Training failed!"
@@ -104,14 +105,18 @@ sleep 2
 # Phase 2: Evaluation
 echo "📊 Phase 2: Evaluation on multiple benchmarks..."
 python eval_peft.py \
-    --model_name_or_path="$OUTPUT_DIR/ft" \
+    --model_name_or_path="/home/gap/Documents/peft/examples/qalora_finetuning/train_results_alpaca_cleaned_qlora/ft" \
     --base_model="$BASE_MODEL" \
     --tasks="$EVAL_TASKS" \
     --num_fewshot="$NUM_FEWSHOT" \
     --per_device_eval_batch_size="$EVAL_BATCH_SIZE" \
     --test_generation \
     --output_dir="$EVAL_DIR" \
-    --limit="$EVAL_LIMIT"
+    --limit="$EVAL_LIMIT" \
+    --apply_gptq_post_quant \
+    --bits="2"
+    
+
 
 if [ $? -ne 0 ]; then
     echo "❌ Evaluation failed!"

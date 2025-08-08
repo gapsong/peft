@@ -310,6 +310,10 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                     # not supported in safetensors.
                     for shared_tensor_name in names[1:]:
                         output_state_dict[shared_tensor_name] = output_state_dict[shared_tensor_name].clone()
+                # Ensure all tensors are contiguous before saving to safetensors
+                for name, tensor in output_state_dict.items():
+                    if isinstance(tensor, torch.Tensor) and not tensor.is_contiguous():
+                        output_state_dict[name] = tensor.contiguous()
                 if path_initial_model_for_weight_conversion is not None:
                     peft_config = copy.deepcopy(peft_config)
                     peft_config.init_lora_weights = True
