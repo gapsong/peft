@@ -84,8 +84,37 @@ def discover_residual_models(base_dir: str) -> List[Dict[str, Any]]:
     
     return sorted(models, key=lambda x: (x["rank"], x["bits"], x.get("group_size", 0)))
 
+
+def find_corresponding_adapter(base_model_path: str, base_dir: str) -> str:
+    """Find the corresponding adapter for a quantized base model"""
+    base_name = os.path.basename(base_model_path)
+    
+    # Extract rank from base model name: w_res_HuggingFaceTB_SmolLM2-1.7B_r256_daniel_4bit_gs32
+    match = re.search(r'_r(\d+)_', base_name)
+    if not match:
+        return None
+    
+    rank = match.group(1)
+    
+    # Extract model name part: HuggingFaceTB_SmolLM2-1.7B
+    model_match = re.search(r'w_res_(.+)_r\d+_daniel', base_name)
+    if not model_match:
+        return None
+    
+    model_part = model_match.group(1)
+    
+    # Look for corresponding adapter: daniel_adapter_r256_HuggingFaceTB_SmolLM2-1.7B
+    adapter_name = f"daniel_adapter_r{rank}_{model_part}"
+    adapter_path = os.path.join(base_dir, adapter_name)
+    
+    if os.path.exists(adapter_path):
+        return adapter_path
+    
+    return None
+
 def evaluate_residual_model(
     model_info: Dict[str, Any],
+    base_dir: str,
     tasks: str,
     num_fewshot: int = 5,
     limit: int = None,
@@ -94,71 +123,72 @@ def evaluate_residual_model(
     """Evaluate a single residual model"""
     
     model_path = model_info["path"]
-    base_model = model_info["base_model_name"]
     
     print(f"\n🔍 Evaluating: {os.path.basename(model_path)}")
     print(f"   Rank: {model_info['rank']}, Bits: {model_info['bits']}, Group Size: {model_info.get('group_size', 'N/A')}")
     
-    # try:
-    # Load model
-    base_model = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals_r256/w_res_HuggingFaceTB_SmolLM2-1.7B_r256_daniel_4bit_gs128"
-    adapter_path = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals_r256/daniel_adapter_r256_HuggingFaceTB_SmolLM2-1.7B"
-    model, tokenizer = load_model_and_tokenizer(adapter_path, base_model)
-    
-    # Run evaluation
-    results = evaluate_with_lm_eval(
-        model=model,
-        tokenizer=tokenizer,
-        tasks=tasks,
-        num_fewshot=num_fewshot,
-        limit=limit,
-        per_device_eval_batch_size=per_device_eval_batch_size
-    )
-    
-    # Clean up
-    del model
-    torch.cuda.empty_cache()
-   
-    print_results(results)
-
-    return {
-        "model_info": model_info,
-        "evaluation_results": results["results"],
-        "status": "success"
-    }
+    try:
+        # Determine base model and adapter paths
+        if model_info["model_type"] == "residual_quantized":
+            # This is a quantized base model, find its adapter
+            base_model_path = model_path
+            adapter_path = find_corresponding_adapter(model_path, base_dir)
+            
+            if not adapter_path:
+                raise ValueError(f"Could not find corresponding adapter for {os.path.basename(model_path)}")
+            
+            print(f"   Base model: {os.path.basename(base_model_path)}")
+            print(f"   Adapter: {os.path.basename(adapter_path)}")
+            
+        elif model_info["model_type"] == "original_adapter":
+            # This is an adapter, we need the original base model (unquantized)
+            adapter_path = model_path
+            base_model_path = model_info["base_model_name"]  # This should be the HF model name
+            
+            print(f"   Base model: {base_model_path}")
+            print(f"   Adapter: {os.path.basename(adapter_path)}")
         
-    # except Exception as e:
-    #     print(f"❌ Error evaluating {model_path}: {e}")
-    #     return {
-    #         "model_info": model_info,
-    #         "evaluation_results": None,
-    #         "status": "failed",
-    #         "error": str(e)
-    #     }
+        else:
+            raise ValueError(f"Unknown model type: {model_info['model_type']}")
+        
+        # Load model
+        model, tokenizer = load_model_and_tokenizer(adapter_path, base_model_path)
+        
+        # Run evaluation
+        results = evaluate_with_lm_eval(
+            model=model,
+            tokenizer=tokenizer,
+            tasks=tasks,
+            num_fewshot=num_fewshot,
+            limit=limit,
+            per_device_eval_batch_size=per_device_eval_batch_size
+        )
+        
+        # Clean up
+        del model
+        torch.cuda.empty_cache()
+       
+        print_results(results)
 
+        return {
+            "model_info": model_info,
+            "evaluation_results": results["results"],
+            "status": "success"
+        }
+        
+    except Exception as e:
+        print(f"❌ Error evaluating {model_path}: {e}")
+        return {
+            "model_info": model_info,
+            "evaluation_results": None,
+            "status": "failed",
+            "error": str(e)
+        }
 
 def create_residual_performance_table(results: List[Dict], output_dir: str):
-    """Create LaTeX table specifically for residual connection analysis"""
+    """Create LaTeX table matching your specified format with shortstack and error bars"""
     
-    # Group results by rank
-    rank_groups = {}
-    for result in results:
-        if result["status"] != "success":
-            continue
-            
-        rank = result["model_info"]["rank"]
-        if rank not in rank_groups:
-            rank_groups[rank] = []
-        rank_groups[rank].append(result)
-    
-    # Sort each rank group by bits and group_size
-    for rank in rank_groups:
-        rank_groups[rank].sort(key=lambda x: (
-            x["model_info"]["bits"], 
-            x["model_info"].get("group_size", 0)
-        ))
-    
-    # Extract task columns
+    # Task mapping to match your column headers
     task_mapping = {
         "arc_challenge": "ARC-c",
         "arc_easy": "ARC-e", 
@@ -166,9 +196,7 @@ def create_residual_performance_table(results: List[Dict], output_dir: str):
         "hellaswag": "HellaSwag",
         "openbookqa": "OpenBookQA",
         "piqa": "PIQA",
-        "winogrande": "Winogrande",
-        "gsm8k": "GSM8K",
-        "mmlu": "MMLU"
+        "winogrande": "Winogrande"
     }
     
     # Get task columns from first successful result
@@ -176,8 +204,14 @@ def create_residual_performance_table(results: List[Dict], output_dir: str):
     sample_result = next((r for r in results if r["status"] == "success"), None)
     if sample_result:
         for task_name in sample_result["evaluation_results"].keys():
-            latex_name = task_mapping.get(task_name, task_name.upper())
-            task_columns.append((task_name, latex_name))
+            if task_name in task_mapping:
+                task_columns.append((task_name, task_mapping[task_name]))
+    
+    # Sort results by rank, then bits
+    sorted_results = sorted(
+        [r for r in results if r["status"] == "success"],
+        key=lambda x: (x["model_info"]["rank"], x["model_info"]["bits"], x.get("model_info", {}).get("group_size", 0))
+    )
     
     # Generate LaTeX
     latex_content = []
@@ -185,71 +219,68 @@ def create_residual_performance_table(results: List[Dict], output_dir: str):
         "\\begin{table}[htbp]",
         "\\tiny",
         "\\setlength{\\tabcolsep}{3pt}",
-        "\\caption{Performance evaluation of Daniel residual quantization across different ranks ($r$) and quantization levels. Shows the trade-off between adapter rank, residual compression, and task performance.}",
-        "\\label{tab:daniel_residual_quantization_analysis}",
-        "\\centering"
+        "\\caption{Performance evaluation of PiSSA residual quantization across different ranks and quantization levels.}",
+        "\\label{tab:pissa_rank_quant_tradeoff_full}",
+        "\\hspace*{-1cm}",
     ])
     
-    # Table header
-    num_cols = 3 + len(task_columns)  # Rank, Bits, Group Size + tasks
-    col_spec = "c" * num_cols
+    # Table header - match your exact format
+    header_cols = ["\\textbf{Model}"]
+    header_cols.extend([f"\\textbf{{{name}}}" for _, name in task_columns])
+    
+    col_spec = "l" + "c" * len(task_columns)  # Model left-aligned, tasks centered
     latex_content.append(f"\\begin{{tabular}}{{{col_spec}}}")
     latex_content.append("\\toprule")
-    
-    header = ["\\textbf{Rank ($r$)}", "\\textbf{Bits}", "\\textbf{Group Size}"]
-    header.extend([f"\\textbf{{{name}}}" for _, name in task_columns])
-    latex_content.append(" & ".join(header) + " \\\\")
+    latex_content.append(" & ".join(header_cols) + " \\\\")
     latex_content.append("\\midrule")
     
-    # Data rows grouped by rank
-    for rank in sorted(rank_groups.keys()):
-        rank_results = rank_groups[rank]
-        num_rank_rows = len(rank_results)
+    # Data rows
+    for result in sorted_results:
+        model_info = result["model_info"]
+        eval_results = result["evaluation_results"]
         
-        latex_content.append(f"% Rank {rank} block")
-        latex_content.append(f"\\multirow{{{num_rank_rows}}}{{*}}{{{rank}}}")
+        # Create model description with shortstack
+        if model_info["model_type"] == "residual_fp16_base":
+            model_desc = f"\\shortstack{{PiSSA (FP16) \\\\ r={model_info['rank']}}}"
+        elif model_info["model_type"] == "residual_quantized":
+            bits = model_info["bits"]
+            rank = model_info["rank"]
+            group_size = model_info.get("group_size", "N/A")
+            model_desc = f"\\shortstack{{PiSSA ({bits} bit, gs={group_size}) \\\\ r={rank}}}"
+        else:
+            # Fallback for other types
+            model_desc = f"\\shortstack{{PiSSA \\\\ r={model_info['rank']}}}"
         
-        for i, result in enumerate(rank_results):
-            model_info = result["model_info"]
-            eval_results = result["evaluation_results"]
-            
-            row_data = [""]  # Rank handled by multirow
-            
-            # Bits
-            if model_info["bits"] == 16:
-                row_data.append("FP16")
-            else:
-                row_data.append(f"{model_info['bits']}")
-            
-            # Group size
-            group_size = model_info.get("group_size")
-            row_data.append(str(group_size) if group_size else "--")
-            
-            # Task results
-            for task_name, _ in task_columns:
-                if task_name in eval_results:
-                    task_result = eval_results[task_name]
-                    # Find the main metric for this task
-                    main_metric = None
-                    for metric_name, value in task_result.items():
-                        if isinstance(value, (int, float)) and any(
-                            x in metric_name.lower() for x in ["acc", "exact_match", "em", "norm"]
-                        ):
-                            main_metric = value
-                            break
-                    
-                    if main_metric is not None:
-                        row_data.append(f"{main_metric:.3f}")
-                    else:
-                        row_data.append("--")
+        row_data = [model_desc]
+        
+        # Task results with error bars
+        for task_name, _ in task_columns:
+            if task_name in eval_results:
+                task_result = eval_results[task_name]
+                
+                # Find the main accuracy metric and its stderr
+                main_metric = None
+                stderr_metric = None
+                
+                # Look for acc_norm first (preferred), then acc
+                if "acc_norm,none" in task_result and "acc_norm_stderr,none" in task_result:
+                    main_metric = task_result["acc_norm,none"]
+                    stderr_metric = task_result["acc_norm_stderr,none"]
+                elif "acc,none" in task_result and "acc_stderr,none" in task_result:
+                    main_metric = task_result["acc,none"]
+                    stderr_metric = task_result["acc_stderr,none"]
+                
+                if main_metric is not None and stderr_metric is not None:
+                    # Convert to percentage and format with error bar
+                    main_pct = main_metric * 100
+                    stderr_pct = stderr_metric * 100
+                    row_data.append(f"{main_pct:.1f} ± {stderr_pct:.1f}")
                 else:
                     row_data.append("--")
-            
-            latex_content.append(" & ".join(row_data) + " \\\\")
+            else:
+                row_data.append("--")
         
-        # Add separator between rank groups
-        if rank != max(rank_groups.keys()):
-            latex_content.append("\\midrule")
+        latex_content.append(" & ".join(row_data) + " \\\\")
     
     latex_content.extend([
         "\\bottomrule",
@@ -268,8 +299,8 @@ def create_residual_performance_table(results: List[Dict], output_dir: str):
     print(f"{'='*80}")
     print("\n".join(latex_content))
     print(f"{'='*80}")
-
-
+    
+    
 def main():
     parser = argparse.ArgumentParser(description="Evaluate pre-quantized residual connection models")
     
@@ -280,7 +311,7 @@ def main():
     
     # Evaluation configuration
     parser.add_argument("--tasks", type=str, 
-                       default="arc_challenge,hellaswag,piqa,winogrande,gsm8k",
+                       default="arc_challenge,arc_easy,boolq,hellaswag,openbookqa,piqa,winogrande",
                        help="Evaluation tasks")
     parser.add_argument("--num_fewshot", type=int, default=5, help="Number of few-shot examples")
     parser.add_argument("--limit", type=int, help="Limit number of samples for testing")
@@ -333,6 +364,7 @@ def main():
         
         result = evaluate_residual_model(
             model_info=model_info,
+            base_dir=args.residual_models_dir,
             tasks=args.tasks,
             num_fewshot=args.num_fewshot,
             limit=args.limit,
