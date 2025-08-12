@@ -24,7 +24,6 @@ import torch
 import transformers
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig, GPTQConfig, Trainer
-
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 
 
@@ -309,6 +308,66 @@ def train_tokenize_function(examples, tokenizer, query, response):
     data_dict = preprocess(sources, targets, tokenizer)
     return data_dict
 
+def compare_models(model1, model2, model1_name="Model 1", model2_name="Model 2", tolerance=1e-9):
+    """
+    Vergleicht zwei PyTorch-Modelle Parameter für Parameter und gibt detaillierte Unterschiede aus.
+    """
+    print(f"\n{'='*80}")
+    print(f"🔬 Vergleiche '{model1_name}' mit '{model2_name}'")
+    print(f"{'='*80}")
+
+    params1 = dict(model1.named_parameters())
+    params2 = dict(model2.named_parameters())
+
+    # 1. Struktureller Vergleich: Haben beide Modelle die gleichen Parameter-Namen?
+    keys1 = set(params1.keys())
+    keys2 = set(params2.keys())
+
+    if keys1 != keys2:
+        print("❌ STRUKTURELLER UNTERSCHIED!")
+        missing_in_2 = keys1 - keys2
+        missing_in_1 = keys2 - keys1
+        if missing_in_2:
+            print(f"   - Parameter nur in '{model1_name}' gefunden: {list(missing_in_2)[:5]}")
+        if missing_in_1:
+            print(f"   - Parameter nur in '{model2_name}' gefunden: {list(missing_in_1)[:5]}")
+        return False
+
+    # 2. Detaillierter Vergleich der einzelnen Parameter
+    mismatched_params = []
+    for name, param1 in params1.items():
+        param2 = params2[name]
+
+        # Form-Vergleich
+        if param1.shape != param2.shape:
+            mismatched_params.append(f"  - '{name}': Form-Mismatch! {param1.shape} vs {param2.shape}")
+            continue
+
+        # Datentyp-Vergleich
+        if param1.dtype != param2.dtype:
+            mismatched_params.append(f"  - '{name}': Dtype-Mismatch! {param1.dtype} vs {param2.dtype}")
+            continue
+
+        # Werte-Vergleich
+        # torch.equal ist sehr strikt. Wir verwenden allclose für numerische Stabilität.
+        if not torch.allclose(param1, param2, atol=tolerance):
+            diff = torch.abs(param1 - param2).max().item()
+            mismatched_params.append(f"  - '{name}': Werte-Mismatch! Maximale Differenz: {diff:.6e}")
+            continue
+
+    # 3. Ergebnis ausgeben
+    if not mismatched_params:
+        print("✅ Modelle sind identisch!")
+        print(f"   - Alle {len(params1)} Parameter stimmen überein.")
+        return True
+    else:
+        print(f"❌ UNTERSCHIEDE GEFUNDEN! ({len(mismatched_params)} von {len(params1)} Parametern)")
+        # Gib die ersten 10 Unterschiede aus, um die Konsole nicht zu überfluten
+        for mismatch in mismatched_params[:10]:
+            print(mismatch)
+        if len(mismatched_params) > 10:
+            print(f"  ... und {len(mismatched_params) - 10} weitere.")
+        return False
 
 def train():
     parser = transformers.HfArgumentParser(TrainingArguments)
@@ -463,6 +522,7 @@ def train():
         # Phase 1: Setup base model and PEFT
         print("Phase 1: Loading original model and setting up PEFT...")
         model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path)
+
         target_modules = ["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"]
 
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
@@ -481,11 +541,10 @@ def train():
         print("✅ PEFT model with daniel initialization complete")
 
         # Phase 2: Extract base model (with residual weights after daniel_init)
-        base_model = peft_model.get_base_model()
-
+        peft_base_model = peft_model.get_base_model()
         # Create base directory structure
         model_name_clean = script_args.model_name_or_path.replace("/", "_").replace("\\", "_")
-        base_output_dir = os.path.join(script_args.output_dir, "quantized_residuals")
+        base_output_dir = os.path.join(script_args.output_dir, f"quantized_residuals_r{script_args.lora_r}")
         os.makedirs(base_output_dir, exist_ok=True)
 
         # Phase 3: Save adapter (this contains the LoRA matrices from daniel_init)
@@ -494,6 +553,56 @@ def train():
         print(f"Saving daniel adapter to: {adapter_path}")
         peft_model.save_pretrained(adapter_path)
 
+        # Save the residual base model temporarily
+        temp_residual_path = os.path.join(base_output_dir, f"temp_residual_base_r{script_args.lora_r}_fp16")
+        
+        # 🚀 EINFACHSTE LÖSUNG: Direkte State Dict Extraktion
+        print("🚀 Verwende direkte State Dict Methode...")
+        
+        # Hole das State Dict vom base_model
+        base_state_dict = peft_base_model.state_dict()
+        
+        # Erstelle ein neues State Dict nur mit den relevanten Gewichten
+        clean_state_dict = {}
+        
+        for key, value in base_state_dict.items():
+            if "base_layer.weight" in key:
+                # Konvertiere PEFT-Namen zu Standard-Namen
+                clean_key = key.replace(".base_layer.weight", ".weight")
+                clean_state_dict[clean_key] = value.clone()
+            elif "weight" in key and "lora" not in key and "base_layer" not in key:
+                # Normale Gewichte (wie embed_tokens)
+                clean_state_dict[key] = value.clone()
+        
+        print(f"📋 Extrahiert: {len(clean_state_dict)} saubere Gewichte")
+        
+        # Lade das Template und setze die Gewichte
+        residual_model = AutoModelForCausalLM.from_pretrained(
+            script_args.model_name_or_path,
+            torch_dtype=torch.bfloat16
+        )
+        
+        # Lade nur die relevanten Gewichte (strict=False ignoriert fehlende LoRA-Parameter)
+        missing_keys, unexpected_keys = residual_model.load_state_dict(clean_state_dict, strict=False)
+        
+        print(f"✅ State Dict geladen - Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
+        
+        # Speichere das saubere Model
+        residual_model.save_pretrained(temp_residual_path)
+        tokenizer.save_pretrained(temp_residual_path)
+        
+        print("💾 Sauberes Residual-Model gespeichert")
+        
+        # Teste das Laden
+        reloaded_model_loaded = AutoModelForCausalLM.from_pretrained(temp_residual_path, torch_dtype=torch.bfloat16)
+        
+        print("\n🔍 Teste nach State Dict Methode:")
+        compare_models(
+            residual_model, reloaded_model_loaded, 
+            model1_name="Extracted Residual Model", 
+            model2_name="Reloaded Model"
+        )
+        
         # Phase 4: Quantize W_res with different bit configurations
         quantization_configs = [
             {"bits": 2, "group_size": 32},
@@ -502,11 +611,6 @@ def train():
             {"bits": 4, "group_size": 64},  # Different group size for comparison
             {"bits": 4, "group_size": 128},
         ]
-
-        # Save the residual base model temporarily
-        temp_residual_path = os.path.join(base_output_dir, "temp_residual_base")
-        base_model.save_pretrained(temp_residual_path)
-
         quantized_models_info = []
 
         for i, qconfig in enumerate(quantization_configs):
@@ -560,10 +664,10 @@ def train():
 
                 # Save metadata about this quantization
                 metadata = {
-                    "base_model": script_args.model_name_or_path,
+                    "base_model": temp_residual_path,
                     "lora_rank": script_args.lora_r,
                     "lora_alpha": 2 * script_args.lora_r,
-                    "initialization": "daniel",
+                    "initialization": False,
                     "quantization": {
                         "bits": bits,
                         "group_size": group_size,
@@ -639,7 +743,7 @@ def train():
         # Cleanup temporary files
         import shutil
 
-        shutil.rmtree(temp_residual_path)
+        # shutil.rmtree(temp_residual_path)
 
         print(f"\n{'=' * 60}")
         print("🎉 QUANTIZATION SUMMARY")

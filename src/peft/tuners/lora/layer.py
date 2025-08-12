@@ -309,8 +309,20 @@ class LoraLayer(BaseTunerLayer):
         weight = self.get_base_layer().weight.clone().to(torch.float32)
         weight_for_svd = weight.clone().to(torch.float32)
         print(weight_for_svd.shape)
-        # weight_for_svd = weight_for_svd.T
-
+        needs_transpose = False
+        if weight_for_svd.shape == (out_features, in_features):
+            print("✅ Dimensionen stimmen - kein Transpose nötig")
+        elif weight_for_svd.shape == (in_features, out_features):
+            print("⚠️  Dimensionen vertauscht - Transpose erforderlich")
+            weight_for_svd = weight_for_svd.T
+            needs_transpose = True
+        else:
+            raise ValueError(f"Unerwartete Gewichtsform: {weight_for_svd.shape}, erwartet: ({out_features}, {in_features}) oder ({in_features}, {out_features})")
+        
+        if needs_transpose:
+            print("🔄 Transponiere weight_residual zurück zur ursprünglichen Form")
+            weight_residual = weight_residual.T
+            
         # 4. Führe SVD auf der korrekt ausgerichteten Matrix durch
         if init_lora_weights == "daniel":
             U, S, Vh = torch.linalg.svd(weight_for_svd.data, full_matrices=False)
@@ -340,15 +352,16 @@ class LoraLayer(BaseTunerLayer):
         self.lora_B[adapter_name].weight.data = lora_B.to(self.lora_B[adapter_name].weight.dtype)
 
         # 7. Aktualisiere die ursprüngliche Gewichtsmatrix
-        residual = self.scaling[adapter_name] * (lora_B @ lora_A)
-        weight_updated = weight_for_svd.data - residual
+        svd_adapter = self.scaling[adapter_name] * (lora_B @ lora_A)
+        weight_residual = weight_for_svd.data - svd_adapter
 
         # 8. Bringe die aktualisierten Gewichte zurück in ihre Originalform und quantisiere sie
         # Wenn wir am Anfang transponiert haben, müssen wir hier zurück transponieren.
-        # if weight_updated.shape != weight.shape:
-        weight_updated = weight_updated.T
+        if needs_transpose:
+            print("🔄 Transponiere weight_residual zurück zur ursprünglichen Form")
+            weight_residual = weight_residual.T
 
-        self.get_base_layer().weight.data = weight_updated
+        self.get_base_layer().weight.data = weight_residual
 
 
     def daniel_init_working_but_bad_starting_loss(self, adapter_name, init_lora_weights):
@@ -367,7 +380,7 @@ class LoraLayer(BaseTunerLayer):
         weight = self.get_base_layer().dequantize_weight()
         weight_for_svd = weight.clone().to(torch.float32)
         print(weight_for_svd.shape)
-        weight_for_svd = weight_for_svd.T
+        weight_for_svd = weight_for_svd.T # take care
 
         # 4. Führe SVD auf der korrekt ausgerichteten Matrix durch
         if init_lora_weights == "daniel":
@@ -404,7 +417,7 @@ class LoraLayer(BaseTunerLayer):
         # 8. Bringe die aktualisierten Gewichte zurück in ihre Originalform und quantisiere sie
         # Wenn wir am Anfang transponiert haben, müssen wir hier zurück transponieren.
         # if weight_updated.shape != weight.shape:
-        weight_updated = weight_updated.T
+        weight_updated = weight_updated.T # take care
 
         self.base_layer.quantize_to_int(weight_updated.to(weight.dtype))
 
