@@ -23,7 +23,7 @@ def load_model_and_tokenizer(model_name_or_path, base_model=None):
     """Load model and tokenizer from path"""
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -38,6 +38,7 @@ def load_model_and_tokenizer(model_name_or_path, base_model=None):
             adapter_config = json.load(f)
 
         # Get base model name
+        # hier muss das basemodel mit dem residual model austausgetauscht werden
         base_model_name = adapter_config.get("base_model_name_or_path")
         if base_model:
             base_model_name = base_model
@@ -46,14 +47,21 @@ def load_model_and_tokenizer(model_name_or_path, base_model=None):
             raise ValueError("Base model not specified and not found in adapter config")
 
         print(f"Base model: {base_model_name}")
-
+        # base_model_name = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals/temp_residual_base"
+        # quantized version here
+        # base_model_name = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals/w_res_HuggingFaceTB_SmolLM2-1.7B_r256_daniel_4bit_gs32"
+        
+        # base_model_name = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals/w_res_HuggingFaceTB_SmolLM2-1.7B_r256_daniel_4bit_gs128"
+        
+        # base_model_name = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals/w_res_HuggingFaceTB_SmolLM2-1.7B_r256_daniel_3bit_gs32"
         # Load base model
         base_model_obj = AutoModelForCausalLM.from_pretrained(
-            base_model_name, torch_dtype=torch.bfloat16, device_map="auto"
+            base_model_name, device_map="auto", torch_dtype=torch.float32
         )
-
+        # model_name_or_path = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals/daniel_adapter_r256_HuggingFaceTB_SmolLM2-1.7B"
         # Load PEFT model
-        model = PeftModel.from_pretrained(base_model_obj, model_name_or_path)
+        model = PeftModel.from_pretrained(base_model_obj, model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto")
+        # model = base_model_obj
         model.eval()
 
         print(f"✅ PEFT model loaded successfully")
