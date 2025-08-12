@@ -1,286 +1,303 @@
 #!/bin/bash
-# filepath: /home/gap/Documents/peft/examples/qalora_finetuning/run_group_experiments.sh
+
+# ============================================================================
+# PiSSA Residual Quantization - Training & Evaluation Pipeline
+# ============================================================================
+# This script trains PiSSA models with different ranks and evaluates them
+# across multiple quantization configurations.
+
+set -e  # Exit on any error
 
 # Configuration
-BASE_MODEL="HuggingFaceTB/SmolLM2-1.7B"
-DATASET="yahma/alpaca-cleaned"
-DATASET_SPLIT="train[:10000]"
-
-# Extract base model name for naming
-BASE_MODEL_NAME=$(basename "$BASE_MODEL" | tr '/' '_' | tr '-' '_')
-
-# Training parameters
-LEARNING_RATE="1e-4"
-BATCH_SIZE=4
-GRAD_ACCUM=1
-NUM_EPOCHS=2
-MAX_LENGTH=2048
-
-# Method-specific parameters
-LORA_R=4
-QALORA_GROUP_SIZE=32
-PISSA_NITER=4
-
-# Other training parameters
-WARMUP_RATIO=0.03
-LR_SCHEDULER_TYPE="cosine"
-LOGGING_STEPS=10
-SAVE_STEPS=25000
-EVAL_STEPS=500
-BF16="True"
-DATALOADER_PIN_MEMORY="False"
-REMOVE_UNUSED_COLUMNS="False"
-REPORT_TO="none"
-
-# Evaluation parameters
-EVAL_TASKS="hellaswag,piqa,winogrande,arc_easy,arc_challenge,boolq,openbookqa,wikitext"
-NUM_FEWSHOT=5
-EVAL_BATCH_SIZE=1
-EVAL_LIMIT=300
-
-# Dataset name for paths
-DATASET_NAME=$(basename "$DATASET" | sed 's/-/_/g')
-
-# Define all training modes to run (using space-separated string instead of array)
-TRAINING_MODES="full lora qlora qalora pissa corda"
+SCRIPT_DIR="/home/nudel/Documents/peft/examples/qalora_finetuning"
+BASE_OUTPUT_DIR="/home/nudel/Documents/peft/train_results_debugger"
+LORA_RANKS=(1 2 4 8 16 32 64 512)
+CUDA_DEVICE="0"
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Function to run a single experiment
-run_experiment() {
-    local training_mode=$1
-    
-    # Generate experiment name with base model
-    case "$training_mode" in
-        "qalora")
-            experiment_name="${BASE_MODEL_NAME}_${DATASET_NAME}_${training_mode}_r_${LORA_R}_group_${QALORA_GROUP_SIZE}"
-            ;;
-        "pissa")
-            experiment_name="${BASE_MODEL_NAME}_${DATASET_NAME}_${training_mode}_r_${LORA_R}_niter_${PISSA_NITER}"
-            ;;
-        "lora"|"corda")
-            experiment_name="${BASE_MODEL_NAME}_${DATASET_NAME}_${training_mode}_r_${LORA_R}"
-            ;;
-        *)
-            experiment_name="${BASE_MODEL_NAME}_${DATASET_NAME}_${training_mode}"
-            ;;
-    esac
-    
-    output_dir="train_results_${experiment_name}"
-    eval_dir="eval_results_${experiment_name}"
-    
-    echo -e "${BLUE}🚀 Starting experiment: $experiment_name${NC}"
-    echo -e "${BLUE}  Base model: $BASE_MODEL${NC}"
-    echo -e "${BLUE}  Training mode: $training_mode${NC}"
-    echo -e "${BLUE}  Output dir: $output_dir${NC}"
-    echo -e "${BLUE}  Eval dir: $eval_dir${NC}"
-    echo -e "${BLUE}  Dataset: $DATASET${NC}"
-    echo -e "${BLUE}  LoRA rank: $LORA_R${NC}"
-    
-    if [ "$training_mode" = "qalora" ]; then
-        echo -e "${BLUE}  QALoRA group size: $QALORA_GROUP_SIZE${NC}"
-    elif [ "$training_mode" = "pissa" ]; then
-        echo -e "${BLUE}  PiSSA iterations: $PISSA_NITER${NC}"
-    fi
-    
-    echo ""
-    
-    # Phase 1: Training
-    echo -e "${YELLOW}📚 Phase 1: Training with $training_mode...${NC}"
-    
-    python corda_finetuning.py \
-        --model_name_or_path="$BASE_MODEL" \
-        --training_mode="$training_mode" \
-        --lora_r="$LORA_R" \
-        --qalora_group_size="$QALORA_GROUP_SIZE" \
-        --pissa_niter="$PISSA_NITER" \
-        --learning_rate="$LEARNING_RATE" \
-        --per_device_train_batch_size="$BATCH_SIZE" \
-        --data_path="$DATASET" \
-        --dataset_split="$DATASET_SPLIT" \
-        --dataset_field "instruction" "output" \
-        --num_train_epochs="$NUM_EPOCHS" \
-        --output_dir="$output_dir" \
-        --model_max_length="$MAX_LENGTH" \
-        --gradient_accumulation_steps="$GRAD_ACCUM" \
-        --warmup_ratio="$WARMUP_RATIO" \
-        --lr_scheduler_type="$LR_SCHEDULER_TYPE" \
-        --logging_steps="$LOGGING_STEPS" \
-        --save_steps="$SAVE_STEPS" \
-        --eval_steps="$EVAL_STEPS" \
-        --bf16="$BF16" \
-        --dataloader_pin_memory="$DATALOADER_PIN_MEMORY" \
-        --remove_unused_columns="$REMOVE_UNUSED_COLUMNS" \
-        --report_to="$REPORT_TO"
-    
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ Training failed for $training_mode!${NC}"
-        return 1
-    fi
-    
-    echo -e "${GREEN}✅ Training completed for $training_mode!${NC}"
-    
-    # Wait for cleanup
-    sleep 3
-    
-    # Phase 2: Evaluation
-    echo -e "${YELLOW}📊 Phase 2: Evaluation for $training_mode...${NC}"
-    
-    python eval_peft.py \
-        --model_name_or_path="$output_dir/ft" \
-        --base_model="$BASE_MODEL" \
-        --tasks="$EVAL_TASKS" \
-        --num_fewshot="$NUM_FEWSHOT" \
-        --per_device_eval_batch_size="$EVAL_BATCH_SIZE" \
-        --test_generation \
-        --output_dir="$eval_dir" \
-        --limit="$EVAL_LIMIT"
-    
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}❌ Evaluation failed for $training_mode!${NC}"
-        return 1
-    fi
-    
-    echo -e "${GREEN}✅ Experiment completed for $training_mode!${NC}"
-    echo -e "${GREEN}📁 Training results saved in: $output_dir${NC}"
-    echo -e "${GREEN}📁 Evaluation results saved in: $eval_dir${NC}"
-    echo ""
-    
-    # Optional: Run with post-quantization for comparison
-    if [ "$training_mode" != "full" ]; then
-        echo -e "${YELLOW}🔧 Phase 3: Evaluation with post-quantization for $training_mode...${NC}"
-        
-        eval_dir_quant="${eval_dir}_post_quant"
-        
-        python eval_peft.py \
-            --model_name_or_path="$output_dir/ft" \
-            --base_model="$BASE_MODEL" \
-            --tasks="$EVAL_TASKS" \
-            --num_fewshot="$NUM_FEWSHOT" \
-            --per_device_eval_batch_size="$EVAL_BATCH_SIZE" \
-            --output_dir="$eval_dir_quant" \
-            --limit="$EVAL_LIMIT" \
-            --apply_gptq_post_quant
-        
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}✅ Post-quantization evaluation completed for $training_mode!${NC}"
-            echo -e "${GREEN}📁 Post-quant eval results saved in: $eval_dir_quant${NC}"
-        else
-            echo -e "${YELLOW}⚠️  Post-quantization evaluation failed for $training_mode (continuing...)${NC}"
-        fi
-    fi
-    
-    echo -e "${BLUE}================================================${NC}"
-    echo ""
+# Helper functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
 }
 
-# Function to create summary report
-create_summary() {
-    echo -e "${BLUE}📈 Creating experiment summary...${NC}"
-    
-    summary_file="experiment_summary_${BASE_MODEL_NAME}_$(date +%Y%m%d_%H%M%S).md"
-    
-    cat > "$summary_file" << EOF
-# Experiment Summary
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
 
-**Base Model:** $BASE_MODEL  
-**Dataset:** $DATASET  
-**Dataset Split:** $DATASET_SPLIT  
-**Date:** $(date)
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
 
-## Configuration
-- Learning Rate: $LEARNING_RATE
-- Batch Size: $BATCH_SIZE
-- Epochs: $NUM_EPOCHS
-- Max Length: $MAX_LENGTH
-- LoRA Rank: $LORA_R
-- QALoRA Group Size: $QALORA_GROUP_SIZE
-- PiSSA Iterations: $PISSA_NITER
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
 
-## Training Modes Tested
-EOF
+# Function to fix adapter config
+fix_adapter_config() {
+    local adapter_path="$1"
+    local config_file="$adapter_path/adapter_config.json"
     
-    for mode in $TRAINING_MODES; do
-        case "$mode" in
-            "qalora")
-                experiment_name="${BASE_MODEL_NAME}_${DATASET_NAME}_${mode}_r_${LORA_R}_group_${QALORA_GROUP_SIZE}"
-                ;;
-            "pissa")
-                experiment_name="${BASE_MODEL_NAME}_${DATASET_NAME}_${mode}_r_${LORA_R}_niter_${PISSA_NITER}"
-                ;;
-            "lora"|"corda")
-                experiment_name="${BASE_MODEL_NAME}_${DATASET_NAME}_${mode}_r_${LORA_R}"
-                ;;
-            *)
-                experiment_name="${BASE_MODEL_NAME}_${DATASET_NAME}_${mode}"
-                ;;
-        esac
+    if [[ -f "$config_file" ]]; then
+        log_info "Fixing adapter config: $config_file"
         
-        echo "- **$mode**: train_results_$experiment_name" >> "$summary_file"
+        # Create backup
+        cp "$config_file" "$config_file.backup"
+        
+        # Use jq to set init_lora_weights to false
+        if command -v jq &> /dev/null; then
+            jq '.init_lora_weights = false' "$config_file" > "$config_file.tmp" && mv "$config_file.tmp" "$config_file"
+            log_success "Fixed init_lora_weights in $config_file"
+        else
+            # Fallback: use sed
+            log_warning "jq not found, using sed fallback"
+            sed -i 's/"init_lora_weights": "daniel"/"init_lora_weights": false/g' "$config_file"
+            sed -i 's/"init_lora_weights": true/"init_lora_weights": false/g' "$config_file"
+            log_success "Fixed init_lora_weights using sed"
+        fi
+    else
+        log_error "Adapter config file not found: $config_file"
+    fi
+}
+
+# Function to train model with specific rank
+train_model() {
+    local rank=$1
+    local output_dir="$BASE_OUTPUT_DIR/quantized_residuals_r${rank}"
+    
+    log_info "Starting training for rank $rank..."
+    log_info "Output directory: $output_dir"
+    
+    cd /home/nudel/Documents/peft
+    
+    export CUDA_VISIBLE_DEVICES=$CUDA_DEVICE
+    export PYTHONPATH="/home/nudel/Documents/peft:${PYTHONPATH}"
+    
+    python "$SCRIPT_DIR/corda_finetuning.py" \
+        --model_name_or_path="HuggingFaceTB/SmolLM2-1.7B" \
+        --output_dir="$output_dir" \
+        --data_path="yahma/alpaca-cleaned" \
+        --dataset_split="train[:10000]" \
+        --dataset_field "instruction" "output" \
+        --bits=2 \
+        --lora_r=$rank \
+        --num_train_epochs=2 \
+        --per_device_train_batch_size=4 \
+        --gradient_accumulation_steps=1 \
+        --learning_rate=1e-4 \
+        --lr_scheduler_type="cosine" \
+        --warmup_ratio=0.03 \
+        --bf16=True \
+        --logging_steps=10 \
+        --save_steps=5000 \
+        --eval_steps=500 \
+        --training_mode="pissa_rank_analysis" \
+        --dataloader_pin_memory=False \
+        --remove_unused_columns=False \
+        --report_to="none"
+    
+    if [[ $? -eq 0 ]]; then
+        log_success "Training completed for rank $rank"
+        
+        # Fix adapter config after training
+        local adapter_path="$output_dir/daniel_adapter_r${rank}_HuggingFaceTB_SmolLM2-1.7B"
+        if [[ -d "$adapter_path" ]]; then
+            fix_adapter_config "$adapter_path"
+        else
+            log_warning "Adapter path not found: $adapter_path"
+        fi
+    else
+        log_error "Training failed for rank $rank"
+        return 1
+    fi
+}
+
+# Function to evaluate model with specific rank
+evaluate_model() {
+    local rank=$1
+    local residual_dir="$BASE_OUTPUT_DIR/quantized_residuals_r${rank}"
+    local eval_output_dir="./residual_evaluation_results_r${rank}"
+    
+    log_info "Starting evaluation for rank $rank..."
+    log_info "Residual models dir: $residual_dir"
+    log_info "Evaluation output dir: $eval_output_dir"
+    
+    # Check if residual models directory exists
+    if [[ ! -d "$residual_dir" ]]; then
+        log_error "Residual models directory not found: $residual_dir"
+        return 1
+    fi
+    
+    cd /home/nudel/Documents/peft
+    
+    export CUDA_VISIBLE_DEVICES=$CUDA_DEVICE
+    export PYTHONPATH="/home/nudel/Documents/peft:${PYTHONPATH}"
+    
+    python "$SCRIPT_DIR/evaluate_residual_models.py" \
+        --residual_models_dir="$residual_dir" \
+        --output_dir="$eval_output_dir" \
+        --tasks="hellaswag,piqa,winogrande,arc_easy,arc_challenge,boolq,openbookqa,wikitext" \
+        --num_fewshot=5 \
+        --limit=100 \
+        --save_results \
+        --generate_latex
+    
+    if [[ $? -eq 0 ]]; then
+        log_success "Evaluation completed for rank $rank"
+        log_info "Results saved to: $eval_output_dir"
+    else
+        log_error "Evaluation failed for rank $rank"
+        return 1
+    fi
+}
+
+# Function to create combined results summary
+create_combined_summary() {
+    log_info "Creating combined results summary..."
+    
+    local summary_dir="./combined_residual_analysis_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$summary_dir"
+    
+    # Copy all individual results
+    for rank in "${LORA_RANKS[@]}"; do
+        local eval_dir="./residual_evaluation_results_r${rank}"
+        if [[ -d "$eval_dir" ]]; then
+            cp -r "$eval_dir" "$summary_dir/rank_${rank}_results"
+            log_info "Copied results for rank $rank"
+        fi
     done
     
-    echo "" >> "$summary_file"
-    echo "## Evaluation Tasks" >> "$summary_file"
-    echo "$EVAL_TASKS" | tr ',' '\n' | sed 's/^/- /' >> "$summary_file"
+    # Create a master summary file
+    cat > "$summary_dir/README.md" << EOF
+# PiSSA Residual Quantization Analysis Results
+
+Generated on: $(date)
+
+## Experiment Configuration
+- Model: HuggingFaceTB/SmolLM2-1.7B
+- Training Mode: PiSSA Rank Analysis
+- LoRA Ranks Tested: ${LORA_RANKS[*]}
+- Quantization Bits: 2, 3, 4 (with various group sizes)
+- Evaluation Tasks: hellaswag, piqa, winogrande, arc_easy, arc_challenge, boolq, openbookqa, wikitext
+- Few-shot Examples: 5
+- Sample Limit: 100
+
+## Directory Structure
+EOF
     
-    echo -e "${GREEN}📄 Summary saved to: $summary_file${NC}"
+    for rank in "${LORA_RANKS[@]}"; do
+        echo "- \`rank_${rank}_results/\`: Results for LoRA rank $rank" >> "$summary_dir/README.md"
+    done
+    
+    log_success "Combined summary created in: $summary_dir"
 }
 
 # Main execution
-echo -e "${BLUE}🔬 Starting comprehensive training experiment${NC}"
-echo -e "${BLUE}Base Model: $BASE_MODEL${NC}"
-echo -e "${BLUE}Training Modes: $TRAINING_MODES${NC}"
-echo -e "${BLUE}Dataset: $DATASET${NC}"
-echo ""
-
-# Track successful and failed experiments
-successful_experiments=""
-failed_experiments=""
-
-# Run all experiments
-for mode in $TRAINING_MODES; do
-    if run_experiment "$mode"; then
-        successful_experiments="$successful_experiments $mode"
-    else
-        failed_experiments="$failed_experiments $mode"
-        echo -e "${RED}❌ Experiment failed for $mode, continuing with next...${NC}"
+main() {
+    log_info "Starting PiSSA Residual Quantization Pipeline"
+    log_info "LoRA ranks to process: ${LORA_RANKS[*]}"
+    log_info "Base output directory: $BASE_OUTPUT_DIR"
+    
+    # Check if required directories exist
+    if [[ ! -f "$SCRIPT_DIR/corda_finetuning.py" ]]; then
+        log_error "Training script not found: $SCRIPT_DIR/corda_finetuning.py"
+        exit 1
     fi
     
-    # Clean up GPU memory between experiments
-    echo -e "${YELLOW}🧹 Cleaning up GPU memory...${NC}"
-    python -c "import torch; torch.cuda.empty_cache(); print('GPU memory cleared')" 2>/dev/null || true
-    sleep 5
-done
-
-# Final summary
-echo -e "${BLUE}🏁 All experiments completed!${NC}"
-echo ""
-
-# Count successful experiments
-success_count=$(echo $successful_experiments | wc -w)
-echo -e "${GREEN}✅ Successful experiments ($success_count):${NC}"
-for exp in $successful_experiments; do
-    echo -e "${GREEN}  - $exp${NC}"
-done
-
-# Count failed experiments
-fail_count=$(echo $failed_experiments | wc -w)
-if [ $fail_count -gt 0 ]; then
-    echo ""
-    echo -e "${RED}❌ Failed experiments ($fail_count):${NC}"
-    for exp in $failed_experiments; do
-        echo -e "${RED}  - $exp${NC}"
+    if [[ ! -f "$SCRIPT_DIR/evaluate_residual_models.py" ]]; then
+        log_error "Evaluation script not found: $SCRIPT_DIR/evaluate_residual_models.py"
+        exit 1
+    fi
+    
+    # Create base output directory
+    mkdir -p "$BASE_OUTPUT_DIR"
+    
+    # Phase 1: Training
+    log_info "===== PHASE 1: TRAINING MODELS ====="
+    failed_training=()
+    successful_training=()
+    
+    for rank in "${LORA_RANKS[@]}"; do
+        log_info "Processing rank $rank (${#successful_training[@]}/${#LORA_RANKS[@]} completed)"
+        
+        if train_model $rank; then
+            successful_training+=($rank)
+            log_success "✅ Training successful for rank $rank"
+        else
+            failed_training+=($rank)
+            log_error "❌ Training failed for rank $rank"
+        fi
+        
+        # Small delay between training runs
+        sleep 5
     done
+    
+    # Training summary
+    log_info "===== TRAINING SUMMARY ====="
+    log_success "Successful training: ${successful_training[*]}"
+    if [[ ${#failed_training[@]} -gt 0 ]]; then
+        log_error "Failed training: ${failed_training[*]}"
+    fi
+    
+    # Phase 2: Evaluation
+    log_info "===== PHASE 2: EVALUATING MODELS ====="
+    failed_evaluation=()
+    successful_evaluation=()
+    
+    for rank in "${successful_training[@]}"; do
+        log_info "Evaluating rank $rank (${#successful_evaluation[@]}/${#successful_training[@]} completed)"
+        
+        if evaluate_model $rank; then
+            successful_evaluation+=($rank)
+            log_success "✅ Evaluation successful for rank $rank"
+        else
+            failed_evaluation+=($rank)
+            log_error "❌ Evaluation failed for rank $rank"
+        fi
+        
+        # Small delay between evaluation runs
+        sleep 5
+    done
+    
+    # Evaluation summary
+    log_info "===== EVALUATION SUMMARY ====="
+    log_success "Successful evaluation: ${successful_evaluation[*]}"
+    if [[ ${#failed_evaluation[@]} -gt 0 ]]; then
+        log_error "Failed evaluation: ${failed_evaluation[*]}"
+    fi
+    
+    # Phase 3: Create combined summary
+    if [[ ${#successful_evaluation[@]} -gt 0 ]]; then
+        log_info "===== PHASE 3: CREATING COMBINED SUMMARY ====="
+        create_combined_summary
+    fi
+    
+    # Final summary
+    log_info "===== PIPELINE COMPLETED ====="
+    log_success "Successfully processed ranks: ${successful_evaluation[*]}"
+    log_info "Total models trained: ${#successful_training[@]}/${#LORA_RANKS[@]}"
+    log_info "Total models evaluated: ${#successful_evaluation[@]}/${#successful_training[@]}"
+    
+    if [[ ${#successful_evaluation[@]} -eq ${#LORA_RANKS[@]} ]]; then
+        log_success "🎉 All models processed successfully!"
+    else
+        log_warning "⚠️  Some models failed. Check logs above for details."
+    fi
+}
+
+# Script execution
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # Check for required tools
+    if ! command -v python &> /dev/null; then
+        log_error "Python not found in PATH"
+        exit 1
+    fi
+    
+    # Run main function
+    main "$@"
 fi
-
-# Create summary report
-create_summary
-
-echo ""
-echo -e "${BLUE}🎉 Comprehensive experiment completed!${NC}"
-echo -e "${BLUE}Check individual result directories for detailed outputs.${NC}"
