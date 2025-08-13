@@ -186,7 +186,7 @@ def evaluate_residual_model(
         }
 
 def create_residual_performance_table(results: List[Dict], output_dir: str):
-    """Create LaTeX table matching Overleaf format with model grouping"""
+    """Create LaTeX table matching Overleaf format with WikiText column"""
     
     # Sort and group by rank
     sorted_results = sorted([r for r in results if r["status"] == "success"],
@@ -236,6 +236,8 @@ def create_residual_performance_table(results: List[Dict], output_dir: str):
             
             # Extract metrics
             row_data = ["&", rank_col, "&", quant_desc]
+            
+            # Standard evaluation tasks
             for task in ["arc_challenge", "arc_easy", "boolq", "hellaswag", "openbookqa", "piqa", "winogrande"]:
                 if task in eval_res:
                     tr = eval_res[task]
@@ -248,12 +250,23 @@ def create_residual_performance_table(results: List[Dict], output_dir: str):
                 else:
                     row_data.append("& ")
             
+            # WikiText perplexity (lower is better, no error bars)
+            if "wikitext" in eval_res:
+                wt = eval_res["wikitext"]
+                perplexity = wt.get("word_perplexity,none")
+                if perplexity is not None:
+                    row_data.append(f"& {perplexity:.1f}")
+                else:
+                    row_data.append("& ")
+            else:
+                row_data.append("& ")
+            
             row_data.append("\\\\")
             latex.append(" ".join(row_data))
         
         # Add cmidrule after each rank group (except the last one)
         if rank_idx < len(sorted_ranks) - 1:
-            latex.append("\\cmidrule{2-11}")
+            latex.append("\\cmidrule{2-12}")  # Updated for 12 columns
     
     # Add final midrule
     latex.append("\\midrule")
@@ -264,7 +277,7 @@ def create_residual_performance_table(results: List[Dict], output_dir: str):
         f.write("\n".join(latex))
     
     print(f"📄 LaTeX saved to: {latex_file}")
-    print(f"\n{'='*60}\n" + "\n".join(latex) + f"\n{'='*60}")   
+    print(f"\n{'='*60}\n" + "\n".join(latex) + f"\n{'='*60}")
     
 def main():
     parser = argparse.ArgumentParser(description="Evaluate pre-quantized residual connection models")
