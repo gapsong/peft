@@ -65,6 +65,38 @@ fix_adapter_config() {
     fi
 }
 
+# Function to find the actual residual models directory
+find_actual_residual_dir() {
+    local base_dir="$1"
+    local rank="$2"
+    
+    # Check different possible paths due to nesting
+    local possible_paths=(
+        "$base_dir/quantized_residuals_r${rank}"
+        "$base_dir/quantized_residuals_r${rank}/quantized_residuals_r${rank}"
+        "$base_dir/quantized_residuals/quantized_residuals_r${rank}"
+    )
+    
+    for path in "${possible_paths[@]}"; do
+        if [[ -d "$path" ]]; then
+            # Check if this directory contains actual model files
+            local has_models=false
+            if ls "$path"/w_res_* &>/dev/null || ls "$path"/daniel_adapter_* &>/dev/null; then
+                has_models=true
+            fi
+            
+            if $has_models; then
+                echo "$path"
+                return 0
+            fi
+        fi
+    done
+    
+    log_error "Could not find actual residual models directory for rank $rank"
+    log_error "Searched in: ${possible_paths[*]}"
+    return 1
+}
+
 # Function to train model with specific rank
 train_model() {
     local rank=$1
@@ -104,12 +136,23 @@ train_model() {
     if [[ $? -eq 0 ]]; then
         log_success "Training completed for rank $rank"
         
-        # Fix adapter config after training
-        local adapter_path="$output_dir/daniel_adapter_r${rank}_HuggingFaceTB_SmolLM2-1.7B"
-        if [[ -d "$adapter_path" ]]; then
-            fix_adapter_config "$adapter_path"
-        else
-            log_warning "Adapter path not found: $adapter_path"
+        # Find the actual adapter path (might be nested)
+        local actual_residual_dir
+        actual_residual_dir=$(find_actual_residual_dir "$BASE_OUTPUT_DIR" "$rank")
+        
+        if [[ $? -eq 0 ]]; then
+            local adapter_path="$actual_residual_dir/daniel_adapter_r${rank}_HuggingFaceTB_SmolLM2-1.7B"
+            if [[ -d "$adapter_path" ]]; then
+                fix_adapter_config "$adapter_path"
+            else
+                log_warning "Adapter path not found: $adapter_path"
+                # Try to find it with find command
+                local found_adapter=$(find "$output_dir" -name "daniel_adapter_r${rank}_*" -type d 2>/dev/null | head -1)
+                if [[ -n "$found_adapter" ]]; then
+                    log_info "Found adapter at: $found_adapter"
+                    fix_adapter_config "$found_adapter"
+                fi
+            fi
         fi
     else
         log_error "Training failed for rank $rank"
@@ -120,18 +163,25 @@ train_model() {
 # Function to evaluate model with specific rank
 evaluate_model() {
     local rank=$1
-    local residual_dir="$BASE_OUTPUT_DIR/quantized_residuals_r${rank}"
     local eval_output_dir="./residual_evaluation_results_r${rank}"
     
     log_info "Starting evaluation for rank $rank..."
-    log_info "Residual models dir: $residual_dir"
-    log_info "Evaluation output dir: $eval_output_dir"
     
-    # Check if residual models directory exists
-    if [[ ! -d "$residual_dir" ]]; then
-        log_error "Residual models directory not found: $residual_dir"
+    # Find the actual residual models directory
+    local residual_dir
+    residual_dir=$(find_actual_residual_dir "$BASE_OUTPUT_DIR" "$rank")
+    
+    if [[ $? -ne 0 ]]; then
+        log_error "Could not find residual models directory for rank $rank"
         return 1
     fi
+    
+    log_info "Found residual models dir: $residual_dir"
+    log_info "Evaluation output dir: $eval_output_dir"
+    
+    # List what's in the directory for debugging
+    log_info "Contents of residual directory:"
+    ls -la "$residual_dir" || true
     
     cd /home/nudel/Documents/peft
     
@@ -217,32 +267,36 @@ main() {
     # Create base output directory
     mkdir -p "$BASE_OUTPUT_DIR"
     
-    # Phase 1: Training
-    log_info "===== PHASE 1: TRAINING MODELS ====="
-    failed_training=()
+    # Find existing models (since training is commented out)
+    log_info "===== FINDING EXISTING MODELS ====="
     successful_training=()
     
     for rank in "${LORA_RANKS[@]}"; do
-        log_info "Processing rank $rank (${#successful_training[@]}/${#LORA_RANKS[@]} completed)"
+        local residual_dir
+        residual_dir=$(find_actual_residual_dir "$BASE_OUTPUT_DIR" "$rank")
         
-        if train_model $rank; then
+        if [[ $? -eq 0 ]]; then
+            log_success "Found existing models for rank $rank at: $residual_dir"
             successful_training+=($rank)
-            log_success "✅ Training successful for rank $rank"
+            
+            # Fix adapter config if needed
+            local adapter_path="$residual_dir/daniel_adapter_r${rank}_HuggingFaceTB_SmolLM2-1.7B"
+            if [[ -d "$adapter_path" ]]; then
+                fix_adapter_config "$adapter_path"
+            else
+                # Try to find it with find command
+                local found_adapter=$(find "$residual_dir" -name "daniel_adapter_r${rank}_*" -type d 2>/dev/null | head -1)
+                if [[ -n "$found_adapter" ]]; then
+                    log_info "Found adapter at: $found_adapter"
+                    fix_adapter_config "$found_adapter"
+                fi
+            fi
         else
-            failed_training+=($rank)
-            log_error "❌ Training failed for rank $rank"
+            log_warning "No existing models found for rank $rank"
         fi
-        
-        # Small delay between training runs
-        sleep 5
     done
     
-    # Training summary
-    log_info "===== TRAINING SUMMARY ====="
-    log_success "Successful training: ${successful_training[*]}"
-    if [[ ${#failed_training[@]} -gt 0 ]]; then
-        log_error "Failed training: ${failed_training[*]}"
-    fi
+    log_info "Found existing models for ranks: ${successful_training[*]}"
     
     # Phase 2: Evaluation
     log_info "===== PHASE 2: EVALUATING MODELS ====="
@@ -280,7 +334,7 @@ main() {
     # Final summary
     log_info "===== PIPELINE COMPLETED ====="
     log_success "Successfully processed ranks: ${successful_evaluation[*]}"
-    log_info "Total models trained: ${#successful_training[@]}/${#LORA_RANKS[@]}"
+    log_info "Total models found: ${#successful_training[@]}/${#LORA_RANKS[@]}"
     log_info "Total models evaluated: ${#successful_evaluation[@]}/${#successful_training[@]}"
     
     if [[ ${#successful_evaluation[@]} -eq ${#LORA_RANKS[@]} ]]; then

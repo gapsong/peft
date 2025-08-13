@@ -186,120 +186,85 @@ def evaluate_residual_model(
         }
 
 def create_residual_performance_table(results: List[Dict], output_dir: str):
-    """Create LaTeX table matching your specified format with shortstack and error bars"""
+    """Create LaTeX table matching Overleaf format with model grouping"""
     
-    # Task mapping to match your column headers
-    task_mapping = {
-        "arc_challenge": "ARC-c",
-        "arc_easy": "ARC-e", 
-        "boolq": "BoolQ",
-        "hellaswag": "HellaSwag",
-        "openbookqa": "OpenBookQA",
-        "piqa": "PIQA",
-        "winogrande": "Winogrande"
-    }
+    # Sort and group by rank
+    sorted_results = sorted([r for r in results if r["status"] == "success"],
+                          key=lambda x: (x["model_info"]["rank"], x["model_info"]["bits"], x["model_info"].get("group_size", 0)))
     
-    # Get task columns from first successful result
-    task_columns = []
-    sample_result = next((r for r in results if r["status"] == "success"), None)
-    if sample_result:
-        for task_name in sample_result["evaluation_results"].keys():
-            if task_name in task_mapping:
-                task_columns.append((task_name, task_mapping[task_name]))
+    rank_groups = {}
+    for r in sorted_results:
+        rank = r["model_info"]["rank"]
+        if rank not in rank_groups:
+            rank_groups[rank] = []
+        rank_groups[rank].append(r)
     
-    # Sort results by rank, then bits
-    sorted_results = sorted(
-        [r for r in results if r["status"] == "success"],
-        key=lambda x: (x["model_info"]["rank"], x["model_info"]["bits"], x.get("model_info", {}).get("group_size", 0))
-    )
+    # Generate LaTeX content
+    latex = []
     
-    # Generate LaTeX
-    latex_content = []
-    latex_content.extend([
-        "\\begin{table}[htbp]",
-        "\\tiny",
-        "\\setlength{\\tabcolsep}{3pt}",
-        "\\caption{Performance evaluation of PiSSA residual quantization across different ranks and quantization levels.}",
-        "\\label{tab:pissa_rank_quant_tradeoff_full}",
-        "\\hspace*{-1cm}",
-    ])
+    # SmolLM2 1.7B Block with multirow for all ranks
+    total_rows = sum(len(models) for models in rank_groups.values())
+    latex.append(f"\\multirow{{{total_rows}}}{{*}}{{\\shortstack{{SmolLM2 \\\\ 1.7B}}}}")
     
-    # Table header - match your exact format
-    header_cols = ["\\textbf{Model}"]
-    header_cols.extend([f"\\textbf{{{name}}}" for _, name in task_columns])
+    sorted_ranks = sorted(rank_groups.keys())
     
-    col_spec = "l" + "c" * len(task_columns)  # Model left-aligned, tasks centered
-    latex_content.append(f"\\begin{{tabular}}{{{col_spec}}}")
-    latex_content.append("\\toprule")
-    latex_content.append(" & ".join(header_cols) + " \\\\")
-    latex_content.append("\\midrule")
-    
-    # Data rows
-    for result in sorted_results:
-        model_info = result["model_info"]
-        eval_results = result["evaluation_results"]
+    for rank_idx, rank in enumerate(sorted_ranks):
+        models = rank_groups[rank]
         
-        # Create model description with shortstack
-        if model_info["model_type"] == "residual_fp16_base":
-            model_desc = f"\\shortstack{{PiSSA (FP16) \\\\ r={model_info['rank']}}}"
-        elif model_info["model_type"] == "residual_quantized":
-            bits = model_info["bits"]
-            rank = model_info["rank"]
-            group_size = model_info.get("group_size", "N/A")
-            model_desc = f"\\shortstack{{PiSSA ({bits} bit, gs={group_size}) \\\\ r={rank}}}"
-        else:
-            # Fallback for other types
-            model_desc = f"\\shortstack{{PiSSA \\\\ r={model_info['rank']}}}"
+        # Sort models: FP16 first, then by bits and group_size
+        models.sort(key=lambda x: (0 if x["model_info"]["bits"] == 16 else 1, 
+                                   x["model_info"]["bits"], 
+                                   x["model_info"].get("group_size", 0)))
         
-        row_data = [model_desc]
-        
-        # Task results with error bars
-        for task_name, _ in task_columns:
-            if task_name in eval_results:
-                task_result = eval_results[task_name]
-                
-                # Find the main accuracy metric and its stderr
-                main_metric = None
-                stderr_metric = None
-                
-                # Look for acc_norm first (preferred), then acc
-                if "acc_norm,none" in task_result and "acc_norm_stderr,none" in task_result:
-                    main_metric = task_result["acc_norm,none"]
-                    stderr_metric = task_result["acc_norm_stderr,none"]
-                elif "acc,none" in task_result and "acc_stderr,none" in task_result:
-                    main_metric = task_result["acc,none"]
-                    stderr_metric = task_result["acc_stderr,none"]
-                
-                if main_metric is not None and stderr_metric is not None:
-                    # Convert to percentage and format with error bar
-                    main_pct = main_metric * 100
-                    stderr_pct = stderr_metric * 100
-                    row_data.append(f"{main_pct:.1f} ± {stderr_pct:.1f}")
-                else:
-                    row_data.append("--")
+        for model_idx, result in enumerate(models):
+            info = result["model_info"]
+            eval_res = result["evaluation_results"]
+            
+            # Rank column with multirow
+            if model_idx == 0:
+                rank_col = f"\\multirow{{{len(models)}}}{{*}}{{{rank}}}"
             else:
-                row_data.append("--")
+                rank_col = ""
+            
+            # Quantization description
+            if info["bits"] == 16:
+                quant_desc = "16 (FP16)"
+            elif info["bits"] == 4 and info.get("group_size"):
+                quant_desc = f"4-bit (Gs {info['group_size']})"
+            else:
+                quant_desc = f"{info['bits']}-bit"
+            
+            # Extract metrics
+            row_data = ["&", rank_col, "&", quant_desc]
+            for task in ["arc_challenge", "arc_easy", "boolq", "hellaswag", "openbookqa", "piqa", "winogrande"]:
+                if task in eval_res:
+                    tr = eval_res[task]
+                    acc = tr.get("acc_norm,none", tr.get("acc,none"))
+                    stderr = tr.get("acc_norm_stderr,none", tr.get("acc_stderr,none"))
+                    if acc is not None and stderr is not None:
+                        row_data.append(f"& {acc*100:.1f} ± {stderr*100:.1f}")
+                    else:
+                        row_data.append("& ")
+                else:
+                    row_data.append("& ")
+            
+            row_data.append("\\\\")
+            latex.append(" ".join(row_data))
         
-        latex_content.append(" & ".join(row_data) + " \\\\")
+        # Add cmidrule after each rank group (except the last one)
+        if rank_idx < len(sorted_ranks) - 1:
+            latex.append("\\cmidrule{2-11}")
     
-    latex_content.extend([
-        "\\bottomrule",
-        "\\end{tabular}",
-        "\\end{table}"
-    ])
+    # Add final midrule
+    latex.append("\\midrule")
     
     # Save to file
     latex_file = os.path.join(output_dir, "residual_quantization_analysis.tex")
     with open(latex_file, "w") as f:
-        f.write("\n".join(latex_content))
+        f.write("\n".join(latex))
     
-    print(f"📄 LaTeX table saved to: {latex_file}")
-    print(f"\n{'='*80}")
-    print("📋 RESIDUAL QUANTIZATION ANALYSIS TABLE:")
-    print(f"{'='*80}")
-    print("\n".join(latex_content))
-    print(f"{'='*80}")
-    
+    print(f"📄 LaTeX saved to: {latex_file}")
+    print(f"\n{'='*60}\n" + "\n".join(latex) + f"\n{'='*60}")   
     
 def main():
     parser = argparse.ArgumentParser(description="Evaluate pre-quantized residual connection models")

@@ -154,3 +154,5 @@ histograms
 *temp_merged_model*
 *checkpoint*
 trainer_output
+*residual_evaluation*
+*.tex
