@@ -8,11 +8,29 @@
 
 set -e  # Exit on any error
 
-# Configuration
+# ============================================================================
+# CONFIGURATION - Edit these variables for different models
+# ============================================================================
+MODEL_NAME_OR_PATH="TinyLlama/TinyLlama_v1.1"
+MODEL_SHORT_NAME="TinyLlama_v1.1"  # Used for directory naming
 SCRIPT_DIR="/home/nudel/Documents/peft/examples/qalora_finetuning"
 BASE_OUTPUT_DIR="/home/nudel/Documents/peft/train_results_debugger"
-LORA_RANKS=(1 2 4 8 16 32 64 512)
+LORA_RANKS=(512)
 CUDA_DEVICE="0"
+
+# Training Configuration
+DATA_PATH="yahma/alpaca-cleaned"
+DATASET_SPLIT="train[:10000]"
+NUM_TRAIN_EPOCHS=2
+PER_DEVICE_TRAIN_BATCH_SIZE=4
+LEARNING_RATE=1e-4
+
+# Evaluation Configuration
+EVAL_TASKS="hellaswag,piqa,winogrande,arc_easy,arc_challenge,boolq,openbookqa,wikitext"
+NUM_FEWSHOT=5
+EVAL_LIMIT=100
+
+# ============================================================================
 
 # Colors for output
 RED='\033[0;31m'
@@ -36,6 +54,11 @@ log_warning() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Generate safe model name for file paths
+get_model_name_safe() {
+    echo "$MODEL_NAME_OR_PATH" | sed 's/\//_/g' | sed 's/-/_/g'
 }
 
 # Function to fix adapter config
@@ -62,47 +85,92 @@ fix_adapter_config() {
         fi
     else
         log_error "Adapter config file not found: $config_file"
+        return 1
     fi
 }
 
-# Function to find the actual residual models directory
+# Robust model-specific directory finder - using global variable for return
+FOUND_RESIDUAL_DIR=""
+
 find_actual_residual_dir() {
     local base_dir="$1"
     local rank="$2"
+    local model_name_safe=$(get_model_name_safe)
     
-    # Check different possible paths due to nesting
-    local possible_paths=(
+    FOUND_RESIDUAL_DIR=""  # Reset global variable
+    
+    log_info "Searching for rank $rank models for $model_name_safe..."
+    
+    # Possible directory structures
+    local possible_dirs=(
         "$base_dir/quantized_residuals_r${rank}"
         "$base_dir/quantized_residuals_r${rank}/quantized_residuals_r${rank}"
-        "$base_dir/quantized_residuals/quantized_residuals_r${rank}"
     )
     
-    for path in "${possible_paths[@]}"; do
-        if [[ -d "$path" ]]; then
-            # Check if this directory contains actual model files
-            local has_models=false
-            if ls "$path"/w_res_* &>/dev/null || ls "$path"/daniel_adapter_* &>/dev/null; then
-                has_models=true
+    for dir in "${possible_dirs[@]}"; do
+        if [[ -d "$dir" ]]; then
+            log_info "Checking directory: $dir"
+            
+            # Check for model-specific files
+            local has_adapter=false
+            local has_residual=false
+            
+            # Look for adapter with current model name
+            if find "$dir" -name "daniel_adapter_r${rank}_*${model_name_safe}*" -type d 2>/dev/null | head -1 | grep -q .; then
+                has_adapter=true
+                log_info "Found adapter for $model_name_safe"
             fi
             
-            if $has_models; then
-                echo "$path"
+            # Look for residual weights with current model name
+            if find "$dir" -name "w_res_*${model_name_safe}*_r${rank}_*" -type d 2>/dev/null | head -1 | grep -q .; then
+                has_residual=true
+                log_info "Found residual weights for $model_name_safe"
+            fi
+            
+            # Must have both adapter and residual for this specific model
+            if [[ "$has_adapter" == true && "$has_residual" == true ]]; then
+                log_success "Valid model directory found: $dir"
+                FOUND_RESIDUAL_DIR="$dir"  # Set global variable
                 return 0
+            else
+                log_warning "Directory $dir exists but missing files for $model_name_safe"
+                log_info "  Has adapter: $has_adapter"
+                log_info "  Has residual: $has_residual"
             fi
         fi
     done
     
-    log_error "Could not find actual residual models directory for rank $rank"
-    log_error "Searched in: ${possible_paths[*]}"
+    log_error "Could not find valid residual models directory for rank $rank and model $model_name_safe"
+    log_error "Searched in: ${possible_dirs[*]}"
     return 1
+}
+
+# Function to list all files in a directory for debugging
+debug_list_directory() {
+    local dir="$1"
+    local title="$2"
+    
+    log_info "$title:"
+    if [[ -d "$dir" ]]; then
+        find "$dir" -type f -name "*" | head -20 | while read -r file; do
+            echo "  $(basename "$file")"
+        done
+        local total_files=$(find "$dir" -type f | wc -l)
+        if [[ $total_files -gt 20 ]]; then
+            echo "  ... and $((total_files - 20)) more files"
+        fi
+    else
+        echo "  Directory does not exist"
+    fi
 }
 
 # Function to train model with specific rank
 train_model() {
     local rank=$1
-    local output_dir="$BASE_OUTPUT_DIR/quantized_residuals_r${rank}"
+    local output_dir="$BASE_OUTPUT_DIR"
     
     log_info "Starting training for rank $rank..."
+    log_info "Model: $MODEL_NAME_OR_PATH"
     log_info "Output directory: $output_dir"
     
     cd /home/nudel/Documents/peft
@@ -111,17 +179,16 @@ train_model() {
     export PYTHONPATH="/home/nudel/Documents/peft:${PYTHONPATH}"
     
     python "$SCRIPT_DIR/corda_finetuning.py" \
-        --model_name_or_path="HuggingFaceTB/SmolLM2-1.7B" \
+        --model_name_or_path="$MODEL_NAME_OR_PATH" \
         --output_dir="$output_dir" \
-        --data_path="yahma/alpaca-cleaned" \
-        --dataset_split="train[:10000]" \
+        --data_path="$DATA_PATH" \
+        --dataset_split="$DATASET_SPLIT" \
         --dataset_field "instruction" "output" \
-        --bits=2 \
         --lora_r=$rank \
-        --num_train_epochs=2 \
-        --per_device_train_batch_size=4 \
+        --num_train_epochs=$NUM_TRAIN_EPOCHS \
+        --per_device_train_batch_size=$PER_DEVICE_TRAIN_BATCH_SIZE \
         --gradient_accumulation_steps=1 \
-        --learning_rate=1e-4 \
+        --learning_rate=$LEARNING_RATE \
         --lr_scheduler_type="cosine" \
         --warmup_ratio=0.03 \
         --bf16=True \
@@ -136,23 +203,28 @@ train_model() {
     if [[ $? -eq 0 ]]; then
         log_success "Training completed for rank $rank"
         
-        # Find the actual adapter path (might be nested)
-        local actual_residual_dir
-        actual_residual_dir=$(find_actual_residual_dir "$BASE_OUTPUT_DIR" "$rank")
+        # Verify what was created
+        local created_dir="$BASE_OUTPUT_DIR/quantized_residuals_r${rank}"
+        log_info "Expected training output in: $created_dir"
         
-        if [[ $? -eq 0 ]]; then
-            local adapter_path="$actual_residual_dir/daniel_adapter_r${rank}_HuggingFaceTB_SmolLM2-1.7B"
-            if [[ -d "$adapter_path" ]]; then
-                fix_adapter_config "$adapter_path"
+        if [[ -d "$created_dir" ]]; then
+            debug_list_directory "$created_dir" "Contents of training output directory"
+            
+            # Find and fix adapter config
+            local model_name_safe=$(get_model_name_safe)
+            local found_adapter=$(find "$created_dir" -name "daniel_adapter_r${rank}_*${model_name_safe}*" -type d 2>/dev/null | head -1)
+            
+            if [[ -n "$found_adapter" ]]; then
+                log_info "Found adapter at: $found_adapter"
+                fix_adapter_config "$found_adapter"
             else
-                log_warning "Adapter path not found: $adapter_path"
-                # Try to find it with find command
-                local found_adapter=$(find "$output_dir" -name "daniel_adapter_r${rank}_*" -type d 2>/dev/null | head -1)
-                if [[ -n "$found_adapter" ]]; then
-                    log_info "Found adapter at: $found_adapter"
-                    fix_adapter_config "$found_adapter"
-                fi
+                log_warning "No adapter found for rank $rank and model $model_name_safe"
+                log_info "Available adapters:"
+                find "$created_dir" -name "daniel_adapter_*" -type d 2>/dev/null || echo "  None found"
             fi
+        else
+            log_error "Training output directory not found: $created_dir"
+            return 1
         fi
     else
         log_error "Training failed for rank $rank"
@@ -163,25 +235,22 @@ train_model() {
 # Function to evaluate model with specific rank
 evaluate_model() {
     local rank=$1
-    local eval_output_dir="./residual_evaluation_results_r${rank}"
+    local eval_output_dir="./residual_evaluation_results_${MODEL_SHORT_NAME}_r${rank}"
     
     log_info "Starting evaluation for rank $rank..."
     
     # Find the actual residual models directory
-    local residual_dir
-    residual_dir=$(find_actual_residual_dir "$BASE_OUTPUT_DIR" "$rank")
-    
-    if [[ $? -ne 0 ]]; then
+    if ! find_actual_residual_dir "$BASE_OUTPUT_DIR" "$rank"; then
         log_error "Could not find residual models directory for rank $rank"
         return 1
     fi
     
+    local residual_dir="$FOUND_RESIDUAL_DIR"
     log_info "Found residual models dir: $residual_dir"
     log_info "Evaluation output dir: $eval_output_dir"
     
-    # List what's in the directory for debugging
-    log_info "Contents of residual directory:"
-    ls -la "$residual_dir" || true
+    # Debug: List directory contents
+    debug_list_directory "$residual_dir" "Contents of residual directory"
     
     cd /home/nudel/Documents/peft
     
@@ -191,9 +260,9 @@ evaluate_model() {
     python "$SCRIPT_DIR/evaluate_residual_models.py" \
         --residual_models_dir="$residual_dir" \
         --output_dir="$eval_output_dir" \
-        --tasks="hellaswag,piqa,winogrande,arc_easy,arc_challenge,boolq,openbookqa,wikitext" \
-        --num_fewshot=5 \
-        --limit=100 \
+        --tasks="$EVAL_TASKS" \
+        --num_fewshot=$NUM_FEWSHOT \
+        --limit=$EVAL_LIMIT \
         --save_results \
         --generate_latex
     
@@ -210,12 +279,12 @@ evaluate_model() {
 create_combined_summary() {
     log_info "Creating combined results summary..."
     
-    local summary_dir="./combined_residual_analysis_$(date +%Y%m%d_%H%M%S)"
+    local summary_dir="./combined_residual_analysis_${MODEL_SHORT_NAME}_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$summary_dir"
     
     # Copy all individual results
     for rank in "${LORA_RANKS[@]}"; do
-        local eval_dir="./residual_evaluation_results_r${rank}"
+        local eval_dir="./residual_evaluation_results_${MODEL_SHORT_NAME}_r${rank}"
         if [[ -d "$eval_dir" ]]; then
             cp -r "$eval_dir" "$summary_dir/rank_${rank}_results"
             log_info "Copied results for rank $rank"
@@ -229,13 +298,22 @@ create_combined_summary() {
 Generated on: $(date)
 
 ## Experiment Configuration
-- Model: HuggingFaceTB/SmolLM2-1.7B
+- Model: $MODEL_NAME_OR_PATH
+- Model Short Name: $MODEL_SHORT_NAME
+- Model Name Safe: $(get_model_name_safe)
 - Training Mode: PiSSA Rank Analysis
 - LoRA Ranks Tested: ${LORA_RANKS[*]}
 - Quantization Bits: 2, 3, 4 (with various group sizes)
-- Evaluation Tasks: hellaswag, piqa, winogrande, arc_easy, arc_challenge, boolq, openbookqa, wikitext
-- Few-shot Examples: 5
-- Sample Limit: 100
+- Evaluation Tasks: $EVAL_TASKS
+- Few-shot Examples: $NUM_FEWSHOT
+- Sample Limit: $EVAL_LIMIT
+
+## Training Configuration
+- Data Path: $DATA_PATH
+- Dataset Split: $DATASET_SPLIT
+- Epochs: $NUM_TRAIN_EPOCHS
+- Batch Size: $PER_DEVICE_TRAIN_BATCH_SIZE
+- Learning Rate: $LEARNING_RATE
 
 ## Directory Structure
 EOF
@@ -247,11 +325,45 @@ EOF
     log_success "Combined summary created in: $summary_dir"
 }
 
+# Function to print current configuration
+print_config() {
+    log_info "Current Configuration:"
+    echo "  Model: $MODEL_NAME_OR_PATH"
+    echo "  Model Short Name: $MODEL_SHORT_NAME"
+    echo "  Model Name Safe: $(get_model_name_safe)"
+    echo "  LoRA Ranks: ${LORA_RANKS[*]}"
+    echo "  Data: $DATA_PATH ($DATASET_SPLIT)"
+    echo "  Training: $NUM_TRAIN_EPOCHS epochs, batch_size=$PER_DEVICE_TRAIN_BATCH_SIZE, lr=$LEARNING_RATE"
+    echo "  Evaluation: $EVAL_TASKS (fewshot=$NUM_FEWSHOT, limit=$EVAL_LIMIT)"
+    echo "  CUDA Device: $CUDA_DEVICE"
+    echo ""
+}
+
+# Function to cleanup old model files for different models
+cleanup_old_models() {
+    if [[ "$1" != "--force" ]]; then
+        return 0
+    fi
+    
+    local model_name_safe=$(get_model_name_safe)
+    log_info "Cleaning up models that don't match current model ($model_name_safe)..."
+    
+    for rank in "${LORA_RANKS[@]}"; do
+        local rank_dir="$BASE_OUTPUT_DIR/quantized_residuals_r${rank}"
+        if [[ -d "$rank_dir" ]]; then
+            # Check if directory contains files for different model
+            if ! (find "$rank_dir" -name "*${model_name_safe}*" | head -1 | grep -q .); then
+                log_warning "Found non-matching model files in $rank_dir, backing up..."
+                mv "$rank_dir" "${rank_dir}_backup_$(date +%Y%m%d_%H%M%S)"
+            fi
+        fi
+    done
+}
+
 # Main execution
 main() {
     log_info "Starting PiSSA Residual Quantization Pipeline"
-    log_info "LoRA ranks to process: ${LORA_RANKS[*]}"
-    log_info "Base output directory: $BASE_OUTPUT_DIR"
+    print_config
     
     # Check if required directories exist
     if [[ ! -f "$SCRIPT_DIR/corda_finetuning.py" ]]; then
@@ -267,36 +379,56 @@ main() {
     # Create base output directory
     mkdir -p "$BASE_OUTPUT_DIR"
     
-    # Find existing models (since training is commented out)
-    log_info "===== FINDING EXISTING MODELS ====="
+    # Cleanup old models if requested
+    cleanup_old_models "$1"
+    
+    # Phase 1: Check for existing models OR train new ones
+    log_info "===== PHASE 1: CHECKING FOR EXISTING MODELS ====="
     successful_training=()
+    need_training=()
     
     for rank in "${LORA_RANKS[@]}"; do
-        local residual_dir
-        residual_dir=$(find_actual_residual_dir "$BASE_OUTPUT_DIR" "$rank")
-        
-        if [[ $? -eq 0 ]]; then
-            log_success "Found existing models for rank $rank at: $residual_dir"
+        if find_actual_residual_dir "$BASE_OUTPUT_DIR" "$rank"; then
+            log_success "Found existing models for rank $rank at: $FOUND_RESIDUAL_DIR"
             successful_training+=($rank)
             
             # Fix adapter config if needed
-            local adapter_path="$residual_dir/daniel_adapter_r${rank}_HuggingFaceTB_SmolLM2-1.7B"
-            if [[ -d "$adapter_path" ]]; then
-                fix_adapter_config "$adapter_path"
+            local model_name_safe=$(get_model_name_safe)
+            local found_adapter=$(find "$FOUND_RESIDUAL_DIR" -name "daniel_adapter_r${rank}_*${model_name_safe}*" -type d 2>/dev/null | head -1)
+            
+            if [[ -n "$found_adapter" ]]; then
+                log_info "Found adapter at: $found_adapter"
+                fix_adapter_config "$found_adapter"
             else
-                # Try to find it with find command
-                local found_adapter=$(find "$residual_dir" -name "daniel_adapter_r${rank}_*" -type d 2>/dev/null | head -1)
-                if [[ -n "$found_adapter" ]]; then
-                    log_info "Found adapter at: $found_adapter"
-                    fix_adapter_config "$found_adapter"
-                fi
+                log_warning "Adapter not found for rank $rank"
             fi
         else
             log_warning "No existing models found for rank $rank"
+            need_training+=($rank)
         fi
     done
     
     log_info "Found existing models for ranks: ${successful_training[*]}"
+    log_info "Need training for ranks: ${need_training[*]}"
+    
+    # Phase 1b: Train missing models if any
+    if [[ ${#need_training[@]} -gt 0 ]]; then
+        log_info "===== PHASE 1b: TRAINING MISSING MODELS ====="
+        
+        for rank in "${need_training[@]}"; do
+            log_info "Training rank $rank (${#successful_training[@]}/${#LORA_RANKS[@]} total completed)"
+            
+            if train_model $rank; then
+                successful_training+=($rank)
+                log_success "✅ Training successful for rank $rank"
+            else
+                log_error "❌ Training failed for rank $rank"
+            fi
+            
+            # Small delay between training runs
+            sleep 5
+        done
+    fi
     
     # Phase 2: Evaluation
     log_info "===== PHASE 2: EVALUATING MODELS ====="
@@ -334,7 +466,7 @@ main() {
     # Final summary
     log_info "===== PIPELINE COMPLETED ====="
     log_success "Successfully processed ranks: ${successful_evaluation[*]}"
-    log_info "Total models found: ${#successful_training[@]}/${#LORA_RANKS[@]}"
+    log_info "Total models available: ${#successful_training[@]}/${#LORA_RANKS[@]}"
     log_info "Total models evaluated: ${#successful_evaluation[@]}/${#successful_training[@]}"
     
     if [[ ${#successful_evaluation[@]} -eq ${#LORA_RANKS[@]} ]]; then
