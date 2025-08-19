@@ -112,6 +112,30 @@ def find_corresponding_adapter(base_model_path: str, base_dir: str) -> str:
     
     return None
 
+def find_corresponding_adapter_for_fp16(base_model_path: str, base_dir: str) -> str:
+    """Find the corresponding adapter for an FP16 base model"""
+    base_name = os.path.basename(base_model_path)
+    
+    # Extract rank from FP16 base model name: temp_residual_base_r256_fp16
+    match = re.search(r'temp_residual_base_r(\d+)_fp16', base_name)
+    if not match:
+        return None
+    
+    rank = match.group(1)
+    
+    # For FP16 base models, we need to find the adapter based on the directory structure
+    # Look in parent directory for adapters with same rank
+    parent_dir = os.path.dirname(base_model_path)
+    
+    # Pattern: daniel_adapter_r256_*
+    for item in os.listdir(parent_dir):
+        adapter_pattern = f"daniel_adapter_r{rank}_"
+        if item.startswith(adapter_pattern) and os.path.isdir(os.path.join(parent_dir, item)):
+            adapter_path = os.path.join(parent_dir, item)
+            return adapter_path
+    
+    return None
+
 def evaluate_residual_model(
     model_info: Dict[str, Any],
     base_dir: str,
@@ -139,7 +163,16 @@ def evaluate_residual_model(
             
             print(f"   Base model: {os.path.basename(base_model_path)}")
             print(f"   Adapter: {os.path.basename(adapter_path)}")
+        elif model_info["model_type"] == "residual_fp16_base":
+            # This is an unquantized FP16 base model, find its adapter
+            base_model_path = model_path
+            adapter_path = find_corresponding_adapter_for_fp16(model_path, base_dir)
             
+            if not adapter_path:
+                raise ValueError(f"Could not find corresponding adapter for {os.path.basename(model_path)}")
+            
+            print(f"   Base model (FP16): {os.path.basename(base_model_path)}")
+            print(f"   Adapter: {os.path.basename(adapter_path)}") 
         elif model_info["model_type"] == "original_adapter":
             # This is an adapter, we need the original base model (unquantized)
             adapter_path = model_path
