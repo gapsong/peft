@@ -33,7 +33,7 @@ from peft.utils.integrations import (
     skip_init_on_device,
 )
 from peft.utils.other import transpose
-
+from peft.tuners.tuners_utils import wavelet_decomposition_adapter_pytorch
 from .config import LoraConfig
 
 
@@ -290,8 +290,69 @@ class LoraLayer(BaseTunerLayer):
         # Platzhalter, ersetze ihn durch deine echte Implementierung
         U, S, Vh = torch.linalg.svd(matrix, full_matrices=False)
         return U, S, Vh.T
+    
+    def init_wavelet_svd_adapter(self, adapter_name):
+        """
+        Initialisiert LoRA-Adapter A und B, indem zuerst eine Wavelet-Dekomposition
+        die wichtigsten Informationen der Gewichte extrahiert und DANN SVD auf
+        dieser bereinigten Matrix angewendet wird.
+        """
+        # 1. Konfiguration abrufen
+        rank = self.r[adapter_name]
+        wavelet_keep_ratio = getattr(self.peft_config, "wavelet_keep_ratio", 0.25)
+        wavelet_type = getattr(self.peft_config, "wavelet_type", 'db4')
 
-    # ------------------------------------
+        # 2. Gewichte holen und Dimensionen für SVD vorbereiten
+        out_features = self.lora_B[adapter_name].weight.shape[0]
+        in_features = self.lora_A[adapter_name].weight.shape[1]
+        
+        weight = self.get_base_layer().weight.clone().to(torch.float32)
+        weight_for_decomp = weight.clone()
+        
+        # SVD benötigt (out_features, in_features), wir prüfen und transponieren ggf.
+        needs_transpose = False
+        if weight_for_decomp.shape != (out_features, in_features):
+            if weight_for_decomp.shape == (in_features, out_features):
+                weight_for_decomp = weight_for_decomp.T
+                needs_transpose = True
+            else:
+                raise ValueError(f"Unerwartete Gewichtsform: {weight_for_decomp.shape}")
+
+        # --- Der neue, zweistufige Prozess ---
+        # Schritt 1: Essenz mit Wavelets extrahieren
+        print(f"Schritt 1: Wavelet-Filterung der Gewichte mit keep_ratio={wavelet_keep_ratio}...")
+        wavelet_approx = wavelet_decomposition_adapter_pytorch(
+            A=weight_for_decomp.data,
+            keep_ratio=wavelet_keep_ratio,
+            wavelet=wavelet_type
+        )
+
+        # Schritt 2: SVD auf die bereinigte Essenz anwenden, um A und B zu erhalten
+        print(f"Schritt 2: SVD auf der Wavelet-Approximation mit Rang r={rank} anwenden...")
+        U, S, Vh = torch.linalg.svd(wavelet_approx, full_matrices=False)
+        
+        # SVD-Initialisierung: Singulärwerte auf A und B aufteilen für stabile Gewichte
+        lora_B = U[:, :rank] @ torch.diag(torch.sqrt(S[:rank]))
+        lora_A = torch.diag(torch.sqrt(S[:rank])) @ Vh[:rank, :]
+        # --- Ende des neuen Prozesses ---
+
+        # 3. Weise die neuen Gewichte den lora_A und lora_B Layern zu
+        self.lora_A[adapter_name].weight.data = lora_A.to(self.lora_A[adapter_name].weight.dtype)
+        self.lora_B[adapter_name].weight.data = lora_B.to(self.lora_B[adapter_name].weight.dtype)
+        print("✅ lora_A und lora_B wurden via Wavelet-SVD initialisiert.")
+    
+        # 4. Aktualisiere die ursprüngliche Gewichtsmatrix (PiSSA-Logik)
+        reconstructed_adapter = self.scaling[adapter_name] * (lora_B @ lora_A)
+        weight_residual = weight_for_decomp.data - reconstructed_adapter
+
+        # 5. Bringe die Residual-Gewichte zurück in ihre Originalform, falls transponiert wurde
+        if needs_transpose:
+            print("🔄 Transponiere weight_residual zurück zur ursprünglichen Form")
+            weight_residual = weight_residual.T
+
+        self.get_base_layer().weight.data = weight_residual.to(self.get_base_layer().weight.dtype)
+        print("✅ Basis-Layer wurde mit dem Residual aktualisiert.")
+
 
     def daniel_init(self, adapter_name, init_lora_weights):
         """

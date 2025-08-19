@@ -37,6 +37,9 @@ from peft.utils.constants import (
     MIN_TARGET_MODULES_FOR_OPTIMIZATION,
     SEQ_CLS_HEAD_NAMES,
 )
+from pytorch_wavelets import DWTForward, DWTInverse
+import pywt 
+
 from peft.utils.integrations import init_empty_weights
 from peft.utils.other import AuxiliaryTrainingWrapper, set_additional_trainable_modules
 from peft.utils.peft_types import PeftType, TaskType
@@ -1344,3 +1347,86 @@ def replicate_layers(model: nn.Module, layer_map: list[tuple[int, int]]):
         raise ValueError("Unexpected model type, need to handle post-processing of layers.")
     if hasattr(model.config, "num_hidden_layers"):  # Common to Llama, Bert, Falcon.
         model.config.num_hidden_layers = len(new_layers)
+
+def calculate_effective_ratio_from_rank(r, out_features, in_features):
+    """
+    Berechnet das effektive Parameter-Ratio für einen gegebenen LoRA-Rang 'r'.
+    """
+    original_params = out_features * in_features
+    if original_params == 0:
+        return 0
+    
+    adapter_params = (out_features * r) + (r * in_features)
+    
+    return adapter_params / original_params
+
+
+def wavelet_decomposition_adapter_pytorch(A, keep_ratio=0.1, wavelet='db4', level=None):
+    """
+    Führt eine Wavelet-Dekomposition auf einer Matrix A vollständig in PyTorch durch.
+    Behält nur die wichtigsten Koeffizienten und rekonstruiert daraus einen "Adapter".
+    Diese Version ist GPU-kompatibel und vermeidet CPU/NumPy-Konvertierungen.
+
+    Args:
+        A (torch.Tensor): Die Eingabematrix (z.B. Gewichte). Muss 2D sein.
+        keep_ratio (float): Der prozentuale Anteil der Koeffizienten, die beibehalten werden.
+        wavelet (str): Der Name des zu verwendenden Wavelets.
+        level (int, optional): Die Anzahl der Dekompositionslevel. Wenn None, wird
+                               das Maximum an möglichen Leveln berechnet.
+
+    Returns:
+        torch.Tensor: Der rekonstruierte "Wavelet-Adapter" mit der gleichen Form wie A.
+    """
+    device = A.device
+    original_shape = A.shape
+    
+    # 1. Bereite die Transformation vor
+    # pytorch_wavelets erwartet einen 4D-Tensor: (N, C, H, W)
+    # Wir fügen Batch- (N) und Channel-Dimensionen (C) hinzu.
+    A_4d = A.unsqueeze(0).unsqueeze(0)
+
+    if level is None:
+        # Berechne die maximal mögliche Anzahl an Dekompositionsleveln
+        level = pywt.dwtn_max_level(A.shape, wavelet)
+
+    # Erstelle die Vorwärts- und Rückwärts-Transformationen
+    dwt = DWTForward(J=level, mode='symmetric', wave=wavelet).to(device)
+    idwt = DWTInverse(mode='symmetric', wave=wavelet).to(device)
+
+    # 2. Führe die Vorwärts-DWT durch
+    # Yl ist der Low-Pass-Anteil (Approximation)
+    # Yh ist eine Liste von High-Pass-Anteilen (Details für jedes Level)
+    Yl, Yh = dwt(A_4d)
+
+    # 3. Finde den globalen Schwellenwert über alle Koeffizienten hinweg
+    # Wir sammeln alle Koeffizienten in einem einzigen Tensor, um das Quantil zu bestimmen
+    all_coeffs = [Yl.flatten()]
+    for h in Yh:
+        all_coeffs.append(h.flatten())
+    
+    # Verkette alle Koeffizienten zu einem 1D-Tensor
+    flat_coeffs = torch.cat(all_coeffs)
+    
+    # Berechne den Schwellenwert basierend auf der Magnitude
+    abs_coeffs = torch.abs(flat_coeffs)
+    threshold = torch.quantile(abs_coeffs, 1 - keep_ratio)
+    
+    # 4. Wende das Thresholding auf die ursprünglichen Koeffizienten-Tensoren an
+    # Wir erstellen eine Maske und setzen Werte unter dem Threshold auf 0
+    Yl_thresh = Yl * (torch.abs(Yl) >= threshold)
+    
+    Yh_thresh = []
+    for h in Yh:
+        Yh_thresh.append(h * (torch.abs(h) >= threshold))
+
+    # 5. Führe die inverse DWT mit den bereinigten Koeffizienten durch
+    reconstructed_A_4d = idwt((Yl_thresh, Yh_thresh))
+    
+    # 6. Bringe den Tensor zurück in seine ursprüngliche 2D-Form
+    # Entferne die Batch- und Channel-Dimensionen
+    reconstructed_A = reconstructed_A_4d.squeeze(0).squeeze(0)
+    
+    # Stelle sicher, dass die Form exakt der Originalform entspricht (sollte sie, aber sicher ist sicher)
+    reconstructed_A = reconstructed_A[:original_shape[0], :original_shape[1]]
+
+    return reconstructed_A
