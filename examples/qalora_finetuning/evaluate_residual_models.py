@@ -13,6 +13,7 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM
 from eval_peft import load_model_and_tokenizer, evaluate_with_lm_eval, print_results
+from typing import Dict, Optional 
 
 
 def parse_residual_model_info(model_path: str) -> Dict[str, Any]:
@@ -188,7 +189,7 @@ def evaluate_residual_model(
         model, tokenizer = load_model_and_tokenizer(adapter_path, base_model_path)
        
 
-        errors = calculate_reconstruction_errors(adapter_path, model)
+        errors = calculate_reconstruction_errors(adapter_path, model, visualization_path="./layer_heatmaps_rank_16")
         svd_error = errors.get('svd_error', 0.0)
         quant_error = errors.get('quant_error', 0.0)
         total_error = errors.get('total_error', 0.0)
@@ -341,7 +342,9 @@ def _get_lora_target_modules(peft_model: PeftModel) -> Dict[str, torch.nn.Module
 
 def calculate_reconstruction_errors(
     adapter_path: str,
-    peft_model: PeftModel
+    peft_model: PeftModel,
+    visualization_path: Optional[str] = None
+
 ) -> Dict[str, float]:
     """
     Berechnet die relativen SVD-, Quantisierungs- und Gesamtfehler für ein PEFT-Modell
@@ -354,6 +357,9 @@ def calculate_reconstruction_errors(
     Returns:
         Ein Dictionary, das die berechneten relativen Fehler für 'svd', 'quant' und 'total' enthält.
     """
+    if visualization_path:
+        os.makedirs(visualization_path, exist_ok=True)
+        print(f"Heatmaps werden in '{visualization_path}' gespeichert.")
         # Check if this is a PEFT model
     adapter_config_path = os.path.join(adapter_path, "adapter_config.json")
 
@@ -412,6 +418,15 @@ def calculate_reconstruction_errors(
             R_true = W_original - W_svd
             W_reconstructed = R_quant + W_svd
 
+            if visualization_path:
+                create_and_save_layer_heatmaps(
+                    layer_name=peft_layer_name,
+                    output_path=visualization_path,
+                    w_original_tensor=W_original,
+                    r_true_tensor=R_true,
+                    r_quant_tensor=R_quant
+                )
+
             svd_error_tensor = W_original - W_svd
             quant_error_tensor = R_true - R_quant
             total_error_tensor = W_original - W_reconstructed
@@ -436,6 +451,77 @@ def calculate_reconstruction_errors(
             "total_error": error_total,
         }
  
+def create_and_save_layer_heatmaps(
+    layer_name: str,
+    output_path: str,
+    w_original_tensor: torch.Tensor,
+    r_true_tensor: torch.Tensor,
+    r_quant_tensor: torch.Tensor,
+    log_scale_threshold: float = 1e-3  # Schwellenwert für den linearen Bereich um Null
+):
+    """
+    Erstellt und speichert eine verbesserte Heatmap mit SymLogNorm,
+    um die Struktur trotz Ausreißern sichtbar zu machen.
+    
+    Args:
+        ... (Parameter sind die gleichen wie zuvor) ...
+        log_scale_threshold: Der Bereich um Null, der linear bleibt. Kleinere Werte 
+                             zeigen mehr Details, können aber bei zu viel Rauschen
+                             überladen wirken. Ein guter Startwert ist 1e-3.
+    """
+    # --- Imports sind hier gekapselt ---
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import SymLogNorm
+
+    plt.switch_backend('Agg')
+
+    # --- Daten für Matplotlib vorbereiten ---
+    original_matrix = w_original_tensor.cpu().numpy()
+    true_residual_matrix = r_true_tensor.cpu().numpy()
+    quant_residual_matrix = r_quant_tensor.cpu().numpy()
+
+    # --- Gemeinsame Skala ermitteln (bleibt wichtig für den Normierungsanker) ---
+    vmax = np.max([np.abs(original_matrix).max(), np.abs(true_residual_matrix).max(), np.abs(quant_residual_matrix).max()])
+    vmin = -vmax
+
+    # --- NEU: SymLogNorm definieren ---
+    # Diese Norm wendet eine logarithmische Skalierung auf Werte an, die außerhalb 
+    # des Schwellenwerts [-linthresh, linthresh] liegen. Das macht feine Strukturen sichtbar.
+    log_norm = SymLogNorm(linthresh=log_scale_threshold, vmin=vmin, vmax=vmax, base=10)
+
+    # --- Plot erstellen ---
+    fig, axes = plt.subplots(1, 3, figsize=(24, 7))
+    fig.suptitle(f"Analyse der Gewichte & Residuen für Layer: {layer_name} (Log-Skala)", fontsize=16)
+    cmap = 'coolwarm'
+
+    # Plot 1: Originalgewichte
+    im = axes[0].imshow(original_matrix, cmap=cmap, norm=log_norm)
+    axes[0].set_title("1. Originalgewichte (W_original)")
+    axes[0].grid(False)
+
+    # Plot 2: Wahres Residuum
+    axes[1].imshow(true_residual_matrix, cmap=cmap, norm=log_norm)
+    axes[1].set_title("2. Wahres Residuum (W - W_svd)")
+    axes[1].grid(False)
+
+    # Plot 3: Quantisiertes Residuum
+    axes[2].imshow(quant_residual_matrix, cmap=cmap, norm=log_norm)
+    axes[2].set_title("3. Quantisiertes Residuum (R_quant)")
+    axes[2].grid(False)
+
+    # Gemeinsame Farbleiste (wird jetzt nicht-linear sein)
+    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.8, label="Gewichtswert")
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    # --- Datei speichern ---
+    safe_filename = layer_name.replace('.', '_') + "_log_scale.png"
+    full_save_path = os.path.join(output_path, safe_filename)
+    plt.savefig(full_save_path, dpi=150)
+    plt.close(fig)
+    
 def main():
     parser = argparse.ArgumentParser(description="Evaluate pre-quantized residual connection models")
     
