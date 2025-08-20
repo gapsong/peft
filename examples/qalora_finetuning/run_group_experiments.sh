@@ -15,7 +15,7 @@ MODEL_NAME_OR_PATH="TinyLlama/TinyLlama_v1.1"
 MODEL_SHORT_NAME="TinyLlama_v1.1"  # Used for directory naming
 SCRIPT_DIR="/home/nudel/Documents/peft/examples/qalora_finetuning"
 BASE_OUTPUT_DIR="/home/nudel/Documents/peft/train_results_debugger"
-LORA_RANKS=(1 2 4 8 16 32 64 256)
+LORA_RANKS=(4 8 16)
 
 CUDA_DEVICE="0"
 

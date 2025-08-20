@@ -554,7 +554,7 @@ def train():
         peft_model.save_pretrained(adapter_path)
 
         # Save the residual base model temporarily
-        temp_residual_path = os.path.join(base_output_dir, f"temp_residual_base_r{script_args.lora_r}_fp16")
+        temp_residual_path = os.path.join(script_args.output_dir, f"temp_residual_base_r{script_args.lora_r}_fp16")
         
         # 🚀 EINFACHSTE LÖSUNG: Direkte State Dict Extraktion
         print("🚀 Verwende direkte State Dict Methode...")
@@ -587,8 +587,10 @@ def train():
         
         print(f"✅ State Dict geladen - Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
         
-        # Speichere das saubere Model
-        residual_model.save_pretrained(temp_residual_path)
+        # has value
+        if not os.path.exists(temp_residual_path):
+            print(f"Speichere sauberes Residual-Model nach: {temp_residual_path}")
+            residual_model.save_pretrained(temp_residual_path)
         tokenizer.save_pretrained(temp_residual_path)
         
         print("💾 Sauberes Residual-Model gespeichert")
@@ -606,10 +608,12 @@ def train():
         # Phase 4: Quantize W_res with different bit configurations
         quantization_configs = [
             {"bits": 2, "group_size": 32},
-            {"bits": 3, "group_size": 32},
-            {"bits": 4, "group_size": 32},
-            {"bits": 4, "group_size": 64},  # Different group size for comparison
-            {"bits": 4, "group_size": 128},
+            {"bits": 2, "group_size": 64},  # Different group size for comparison
+            {"bits": 2, "group_size": 128},
+            # {"bits": 3, "group_size": 32},
+            # {"bits": 4, "group_size": 32},
+            # {"bits": 4, "group_size": 64},  # Different group size for comparison
+            # {"bits": 4, "group_size": 128},
         ]
         quantized_models_info = []
 

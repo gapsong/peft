@@ -10,8 +10,8 @@ import re
 from pathlib import Path
 from typing import List, Dict, Any
 import torch
-
-# Import your existing eval functions
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
 from eval_peft import load_model_and_tokenizer, evaluate_with_lm_eval, print_results
 
 
@@ -186,7 +186,25 @@ def evaluate_residual_model(
         
         # Load model
         model, tokenizer = load_model_and_tokenizer(adapter_path, base_model_path)
-        
+       
+
+        errors = calculate_reconstruction_errors(adapter_path, model)
+        svd_error = errors.get('svd_error', 0.0)
+        quant_error = errors.get('quant_error', 0.0)
+        total_error = errors.get('total_error', 0.0)
+
+        print("\n---[ Analyse der Rekonstruktionsfehler ]---")
+        print(f"  🇸 SVD-Fehler:       {svd_error:>8.4%}")
+        print(f"     (Fehler zwischen W_original und dem reinen LoRA-Adapter)")
+        print("")
+        print(f"  📉 Quant.-Fehler:    {quant_error:>8.4%}")
+        print(f"     (Fehler, der durch die Quantisierung des Residuals entsteht)")
+        print("-" * 45)
+        print(f"  🎯 Gesamtfehler:      {total_error:>8.4%}")
+        print(f"     (Endgültige Abweichung des kombinierten Modells von W_original)")
+        print("-------------------------------------------")
+       
+        limit = 100
         # Run evaluation
         results = evaluate_with_lm_eval(
             model=model,
@@ -311,7 +329,113 @@ def create_residual_performance_table(results: List[Dict], output_dir: str):
     
     print(f"📄 LaTeX saved to: {latex_file}")
     print(f"\n{'='*60}\n" + "\n".join(latex) + f"\n{'='*60}")
+  
+def _get_lora_target_modules(peft_model: PeftModel) -> Dict[str, torch.nn.Module]:
+    """Helper to find all LoRA layers in a PeftModel."""
+    lora_layers = {}
+    for name, module in peft_model.named_modules():
+        # The LoraLayer class is a common parent for LoRA-adapted layers
+        if "lora" in module.__class__.__name__.lower() and hasattr(module, "lora_A"):
+            lora_layers[name] = module
+    return lora_layers
+
+def calculate_reconstruction_errors(
+    adapter_path: str,
+    peft_model: PeftModel
+) -> Dict[str, float]:
+    """
+    Berechnet die relativen SVD-, Quantisierungs- und Gesamtfehler für ein PEFT-Modell
+    mit einer quantisierten residualen Basis im Vergleich zum wahren Originalmodell.
+
+    Args:
+        true_original_model: Das ursprüngliche, unberührte Foundation Model (Ground Truth).
+        peft_model: Das PeftModel, das aus einer quantisierten residualen Basis und einem LoRA-Adapter besteht.
+
+    Returns:
+        Ein Dictionary, das die berechneten relativen Fehler für 'svd', 'quant' und 'total' enthält.
+    """
+        # Check if this is a PEFT model
+    adapter_config_path = os.path.join(adapter_path, "adapter_config.json")
+
+    if os.path.exists(adapter_config_path):
+        print(f"Loading PEFT model from {adapter_path}")
+
+        # Read adapter config
+        with open(adapter_config_path, "r") as f:
+            adapter_config = json.load(f)
+
+        # Get base model name
+        # hier muss das basemodel mit dem residual model austausgetauscht werden
+        base_model_name = adapter_config.get("base_model_name_or_path")
+    else:
+        raise ValueError(f"Adapter config not found at {adapter_config_path}")
     
+    true_original_model = AutoModelForCausalLM.from_pretrained(
+        base_model_name, device_map="auto", torch_dtype=torch.float32
+    )
+    
+    with torch.no_grad():
+        original_modules = dict(true_original_model.named_modules())
+        lora_layers = _get_lora_target_modules(peft_model)
+
+        if not lora_layers:
+            print("Warnung: Keine LoRA-Layer im peft_model gefunden.")
+            return {"svd_error": 0.0, "quant_error": 0.0, "total_error": 0.0}
+
+        total_norm_W_original_sq = 0.0
+        total_norm_svd_error_sq = 0.0
+        total_norm_quant_error_sq = 0.0
+        total_norm_total_error_sq = 0.0
+
+        print(f"Analysiere {len(lora_layers)} LoRA-Layer...")
+        for peft_layer_name, peft_layer in lora_layers.items():
+            # --- NEUE LOGIK: Korrigiere den Layernamen ---
+            # PeftModel fügt Präfixe hinzu. Wir entfernen sie, um den Namen im Originalmodell zu finden.
+            # Beispiel: "base_model.model.model.layers.5.mlp.up_proj" -> "model.layers.5.mlp.up_proj"
+            original_layer_name = peft_layer_name.replace("base_model.model.", "", 1)
+
+            if original_layer_name not in original_modules:
+                print(f"Warnung: Layer '{original_layer_name}' (abgeleitet von '{peft_layer_name}') nicht im true_original_model gefunden. Überspringe.")
+                continue
+            
+            W_original = original_modules[original_layer_name].weight.data.clone().to(torch.float32)
+            R_quant = peft_layer.get_base_layer().dequantize_weight().data.clone().to(torch.float32)
+            R_quant = R_quant.T 
+
+
+            adapter_name = peft_layer.active_adapters[0]
+            lora_A = peft_layer.lora_A[adapter_name].weight.data.clone().to(torch.float32)
+            lora_B = peft_layer.lora_B[adapter_name].weight.data.clone().to(torch.float32)
+            scaling = peft_layer.scaling[adapter_name]
+            W_svd = scaling * (lora_B @ lora_A)
+
+            R_true = W_original - W_svd
+            W_reconstructed = R_quant + W_svd
+
+            svd_error_tensor = W_original - W_svd
+            quant_error_tensor = R_true - R_quant
+            total_error_tensor = W_original - W_reconstructed
+
+            total_norm_W_original_sq += torch.linalg.norm(W_original).pow(2).item()
+            total_norm_svd_error_sq += torch.linalg.norm(svd_error_tensor).pow(2).item()
+            total_norm_quant_error_sq += torch.linalg.norm(quant_error_tensor).pow(2).item()
+            total_norm_total_error_sq += torch.linalg.norm(total_error_tensor).pow(2).item()
+
+        if total_norm_W_original_sq == 0:
+            return {"svd_error": 0.0, "quant_error": 0.0, "total_error": 0.0}
+
+        norm_W_original_total = total_norm_W_original_sq ** 0.5
+        
+        error_svd = (total_norm_svd_error_sq ** 0.5) / norm_W_original_total
+        error_quant = (total_norm_quant_error_sq ** 0.5) / norm_W_original_total
+        error_total = (total_norm_total_error_sq ** 0.5) / norm_W_original_total
+
+        return {
+            "svd_error": error_svd,
+            "quant_error": error_quant,
+            "total_error": error_total,
+        }
+ 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate pre-quantized residual connection models")
     
