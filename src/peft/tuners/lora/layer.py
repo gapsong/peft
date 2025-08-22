@@ -306,7 +306,7 @@ class LoraLayer(BaseTunerLayer):
         out_features = self.lora_B[adapter_name].weight.shape[0]
         in_features = self.lora_A[adapter_name].weight.shape[1]
         
-        weight = self.get_base_layer().weight.clone().to(torch.float32)
+        weight = self.get_base_layer().weight.clone().to(torch.bfloat16)
         weight_for_decomp = weight.clone()
         
         # SVD benötigt (out_features, in_features), wir prüfen und transponieren ggf.
@@ -367,7 +367,7 @@ class LoraLayer(BaseTunerLayer):
         rank = self.r[adapter_name]
 
         # 2. Hole die Gewichte und prüfe die Form
-        weight = self.get_base_layer().weight.clone().to(torch.float32)
+        weight = self.get_base_layer().weight.clone().to(torch.flwoat32)
         weight_for_svd = weight.clone().to(torch.float32)
         print(weight_for_svd.shape)
         needs_transpose = False
@@ -422,7 +422,7 @@ class LoraLayer(BaseTunerLayer):
             print("🔄 Transponiere weight_residual zurück zur ursprünglichen Form")
             weight_residual = weight_residual.T
 
-        self.get_base_layer().weight.data = weight_residual
+        self.get_base_layer().weight.data = weight_residual.to(torch.bfloat16)
 
 
     def daniel_init_working_but_bad_starting_loss(self, adapter_name, init_lora_weights):

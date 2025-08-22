@@ -601,7 +601,7 @@ def train():
             peft_model.save_pretrained(adapter_path)
 
             print("🚀 Extracting residual weights using State Dict method...")
-            peft_base_model = peft_model.get_base_model()
+            peft_base_model = peft_model.get_base_model().to(torch.bfloat16)
             base_state_dict = peft_base_model.state_dict()
             clean_state_dict = {}
             
