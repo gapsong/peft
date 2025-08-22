@@ -17,7 +17,7 @@ import os
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 import datetime
 import numpy as np
 import torch
@@ -35,6 +35,19 @@ PROMPT = (
     "### Instruction:\n{instruction}\n\n### Response:"
 )
 
+def find_all_linear_names(model) -> List[str]:
+    """
+    Finds all linear layer names in a model, excluding the lm_head.
+    This is a robust way to automatically select target_modules for LoRA.
+    """
+    linear_layer_names = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            # Exclude the output layer and embeddings from LoRA training
+            if "lm_head" not in name and "embed_tokens" not in name:
+                linear_layer_names.append(name)
+    print(f"✅ Automatically discovered {len(linear_layer_names)} linear layers to target.")
+    return linear_layer_names
 
 def get_nb_trainable_parameters(model) -> tuple[int, int]:
     r"""
@@ -519,92 +532,114 @@ def train():
     elif script_args.training_mode == "pissa_rank_analysis":
         print("🔧 Setting up rank analysis with multiple quantization configurations...")
 
-        # Phase 1: Setup base model and PEFT
-        print("Phase 1: Loading original model and setting up PEFT...")
-        model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path)
-
-        target_modules = ["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"]
-
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-
-        lora_config = LoraConfig(
-            task_type="CAUSAL_LM",
-            r=script_args.lora_r,
-            lora_alpha=2 * script_args.lora_r,
-            target_modules=target_modules,
-            lora_dropout=0.05,
-            bias="none",
-            init_lora_weights="daniel",
-        )
-
-        peft_model = get_peft_model(model, lora_config)
-        print("✅ PEFT model with daniel initialization complete")
-
-        # Phase 2: Extract base model (with residual weights after daniel_init)
-        peft_base_model = peft_model.get_base_model()
-        # Create base directory structure
+        # --- CACHING LOGIC START ---
+        # Phase 1: Definiere Pfade und prüfe auf existierende Artefakte
         model_name_clean = script_args.model_name_or_path.replace("/", "_").replace("\\", "_")
         base_output_dir = os.path.join(script_args.output_dir, f"quantized_residuals_r{script_args.lora_r}")
         os.makedirs(base_output_dir, exist_ok=True)
 
-        # Phase 3: Save adapter (this contains the LoRA matrices from daniel_init)
         adapter_name = f"daniel_adapter_r{script_args.lora_r}_{model_name_clean}"
         adapter_path = os.path.join(base_output_dir, adapter_name)
-        print(f"Saving daniel adapter to: {adapter_path}")
-        peft_model.save_pretrained(adapter_path)
-
-        # Save the residual base model temporarily
+        
         temp_residual_path = os.path.join(script_args.output_dir, f"{model_name_clean}_residual_base_r{script_args.lora_r}_fp16")
-        
-        # 🚀 EINFACHSTE LÖSUNG: Direkte State Dict Extraktion
-        print("🚀 Verwende direkte State Dict Methode...")
-        
-        # Hole das State Dict vom base_model
-        base_state_dict = peft_base_model.state_dict()
-        
-        # Erstelle ein neues State Dict nur mit den relevanten Gewichten
-        clean_state_dict = {}
-        
-        for key, value in base_state_dict.items():
-            if "base_layer.weight" in key:
-                # Konvertiere PEFT-Namen zu Standard-Namen
-                clean_key = key.replace(".base_layer.weight", ".weight")
-                clean_state_dict[clean_key] = value.clone()
-            elif "weight" in key and "lora" not in key and "base_layer" not in key:
-                # Normale Gewichte (wie embed_tokens)
-                clean_state_dict[key] = value.clone()
-        
-        print(f"📋 Extrahiert: {len(clean_state_dict)} saubere Gewichte")
-        
-        # Lade das Template und setze die Gewichte
-        residual_model = AutoModelForCausalLM.from_pretrained(
-            script_args.model_name_or_path,
-            torch_dtype=torch.bfloat16
-        )
-        
-        # Lade nur die relevanten Gewichte (strict=False ignoriert fehlende LoRA-Parameter)
-        missing_keys, unexpected_keys = residual_model.load_state_dict(clean_state_dict, strict=False)
-        
-        print(f"✅ State Dict geladen - Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
-        
-        # has value
-        if not os.path.exists(temp_residual_path):
-            print(f"Speichere sauberes Residual-Model nach: {temp_residual_path}")
+
+        # Prüfe, ob sowohl der Adapter als auch das Residual-Modell bereits existieren
+        if os.path.exists(adapter_path) and os.path.exists(temp_residual_path):
+            print(f"⏭️  Found cached adapter at: {adapter_path}")
+            print(f"⏭️  Found cached residual model at: {temp_residual_path}")
+            print("    Skipping model initialization and residual extraction.")
+            
+            # Lade die target_modules aus der Adapter-Konfiguration für die spätere Verwendung
+            from peft import PeftConfig
+            try:
+                config = PeftConfig.from_pretrained(adapter_path)
+                target_modules = config.target_modules
+                print(f"    Loaded target_modules from adapter config: {len(target_modules)} modules.")
+            except Exception as e:
+                print(f"    Could not load adapter config ({e}), using empty target_modules list.")
+                target_modules = []
+        else:
+            print("🔥 No cached artifacts found. Starting full initialization process...")
+            
+            # Phase 2: Lade das Originalmodell und richte PEFT ein
+            print("Phase 2: Loading original model and setting up PEFT...")
+            model = AutoModelForCausalLM.from_pretrained(
+                script_args.model_name_or_path,
+                low_cpu_mem_usage=True,
+                torch_dtype=torch.bfloat16,
+                device_map="cpu",
+            )
+            
+            # Entdecke automatisch alle relevanten Layer-Namen
+            target_modules = find_all_linear_names(model)
+            
+            # Gib das CPU-Modell frei, wir laden es gleich richtig
+            del model
+            torch.cuda.empty_cache()
+
+            model = AutoModelForCausalLM.from_pretrained(
+                script_args.model_name_or_path,
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+            )
+
+            lora_config = LoraConfig(
+                task_type="CAUSAL_LM",
+                r=script_args.lora_r,
+                lora_alpha=2 * script_args.lora_r,
+                target_modules=target_modules,
+                lora_dropout=0.05,
+                bias="none",
+                init_lora_weights="daniel",
+            )
+
+            peft_model = get_peft_model(model, lora_config)
+            print("✅ PEFT model with daniel initialization complete")
+
+            # Phase 3: Extrahiere und speichere den Adapter und das Residual-Modell
+            print(f"Phase 3: Saving adapter to: {adapter_path}")
+            peft_model.save_pretrained(adapter_path)
+
+            print("🚀 Extracting residual weights using State Dict method...")
+            peft_base_model = peft_model.get_base_model()
+            base_state_dict = peft_base_model.state_dict()
+            clean_state_dict = {}
+            
+            for key, value in base_state_dict.items():
+                if "base_layer.weight" in key:
+                    clean_key = key.replace(".base_layer.weight", ".weight")
+                    clean_state_dict[clean_key] = value.clone()
+                elif "weight" in key and "lora" not in key and "base_layer" not in key:
+                    clean_state_dict[key] = value.clone()
+            
+            # Füge den lm_head manuell hinzu, da get_base_model() ihn oft auslässt
+            if "lm_head.weight" in peft_model.state_dict():
+                print("🧠 Adding lm_head.weight to the clean state_dict.")
+                clean_state_dict["lm_head.weight"] = peft_model.state_dict()["lm_head.weight"].clone()
+
+            print(f"📋 Extracted: {len(clean_state_dict)} clean weights")
+            
+            residual_model = AutoModelForCausalLM.from_pretrained(
+                script_args.model_name_or_path, torch_dtype=torch.bfloat16
+            )
+            
+            residual_model.load_state_dict(clean_state_dict, strict=False)
+            
+            print(f"💾 Saving clean residual model to: {temp_residual_path}")
             residual_model.save_pretrained(temp_residual_path)
-        tokenizer.save_pretrained(temp_residual_path)
+            tokenizer.save_pretrained(temp_residual_path)
+            print("✅ Clean residual model saved.")
+            
+            # Verifiziere den Speicher-/Ladevorgang
+            reloaded_model_loaded = AutoModelForCausalLM.from_pretrained(temp_residual_path, torch_dtype=torch.bfloat16)
+            compare_models(
+                residual_model, reloaded_model_loaded, 
+                model1_name="Extracted Residual Model", 
+                model2_name="Reloaded Model"
+            )
         
-        print("💾 Sauberes Residual-Model gespeichert")
-        
-        # Teste das Laden
-        reloaded_model_loaded = AutoModelForCausalLM.from_pretrained(temp_residual_path, torch_dtype=torch.bfloat16)
-        
-        print("\n🔍 Teste nach State Dict Methode:")
-        compare_models(
-            residual_model, reloaded_model_loaded, 
-            model1_name="Extracted Residual Model", 
-            model2_name="Reloaded Model"
-        )
-        
+        # --- CACHING LOGIC END ---
+
         # Phase 4: Quantize W_res with different bit configurations
         quantization_configs = [
             {"bits": 2, "group_size": 32},
