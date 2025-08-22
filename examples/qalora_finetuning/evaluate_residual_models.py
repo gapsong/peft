@@ -422,7 +422,7 @@ def calculate_reconstruction_errors(
             R_true = W_original - W_svd
             W_reconstructed = R_quant + W_svd
 
-            if True:
+            if False:
                 create_and_save_layer_heatmaps(
                     layer_name=peft_layer_name,
                     output_path=visualization_path,
@@ -677,7 +677,6 @@ def main():
     # Run evaluations
     print(f"\n🚀 Starting evaluation of {len(all_models)} models...")
     all_results = []
-    all_models = all_models[:1] 
     for i, model_info in enumerate(all_models, 1):
         print(f"\n{'='*60}")
         print(f"🏁 EVALUATING MODEL {i}/{len(all_models)}")
