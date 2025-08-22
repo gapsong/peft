@@ -11,11 +11,11 @@ set -e  # Exit on any error
 # ============================================================================
 # CONFIGURATION - Edit these variables for different models
 # ============================================================================
-MODEL_NAME_OR_PATH="TinyLlama/TinyLlama_v1.1"
-MODEL_SHORT_NAME="TinyLlama_v1.1"  # Used for directory naming
+MODEL_NAME_OR_PATH="Qwen/Qwen3-4B"
+MODEL_SHORT_NAME="Qwen3-4B"  # Used for directory naming
 SCRIPT_DIR="/home/nudel/Documents/peft/examples/qalora_finetuning"
 BASE_OUTPUT_DIR="/home/nudel/Documents/peft/train_results_debugger"
-LORA_RANKS=(4 8 16)
+LORA_RANKS=(1 2 4 8 16 32 64 256 512)
 
 CUDA_DEVICE="0"
 

@@ -56,7 +56,7 @@ def load_model_and_tokenizer(model_name_or_path, base_model=None):
         # base_model_name = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals/w_res_HuggingFaceTB_SmolLM2-1.7B_r256_daniel_3bit_gs32"
         # Load base model
         base_model_obj = AutoModelForCausalLM.from_pretrained(
-            base_model_name, device_map="auto", torch_dtype=torch.float32
+            base_model_name, device_map="auto", torch_dtype=torch.float16
         )
         # model_name_or_path = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals/daniel_adapter_r256_HuggingFaceTB_SmolLM2-1.7B"
         # Load PEFT model

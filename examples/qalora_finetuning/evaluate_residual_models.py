@@ -188,8 +188,8 @@ def evaluate_residual_model(
         # Load model
         model, tokenizer = load_model_and_tokenizer(adapter_path, base_model_path)
        
-
-        errors = calculate_reconstruction_errors(adapter_path, model, visualization_path="./layer_heatmaps_rank_16")
+        prefix = "/home/nudel/Documents/peft/visualizations"
+        errors = calculate_reconstruction_errors(adapter_path, model, visualization_path=f"{prefix}/layer_heatmaps_rank_16", svd_visualization_path=f"{prefix}/svd_heatmaps_rank_16")
         svd_error = errors.get('svd_error', 0.0)
         quant_error = errors.get('quant_error', 0.0)
         total_error = errors.get('total_error', 0.0)
@@ -343,8 +343,8 @@ def _get_lora_target_modules(peft_model: PeftModel) -> Dict[str, torch.nn.Module
 def calculate_reconstruction_errors(
     adapter_path: str,
     peft_model: PeftModel,
-    visualization_path: Optional[str] = None
-
+    visualization_path: Optional[str] = None,
+    svd_visualization_path: Optional[str] = None
 ) -> Dict[str, float]:
     """
     Berechnet die relativen SVD-, Quantisierungs- und Gesamtfehler für ein PEFT-Modell
@@ -377,9 +377,13 @@ def calculate_reconstruction_errors(
         raise ValueError(f"Adapter config not found at {adapter_config_path}")
     
     true_original_model = AutoModelForCausalLM.from_pretrained(
-        base_model_name, device_map="auto", torch_dtype=torch.float32
+        base_model_name, device_map="auto", torch_dtype=torch.bfloat16
     )
     
+    if svd_visualization_path:
+        os.makedirs(svd_visualization_path, exist_ok=True)
+        print(f"SVD-Analysen werden in '{svd_visualization_path}' gespeichert.")
+        
     with torch.no_grad():
         original_modules = dict(true_original_model.named_modules())
         lora_layers = _get_lora_target_modules(peft_model)
@@ -418,13 +422,21 @@ def calculate_reconstruction_errors(
             R_true = W_original - W_svd
             W_reconstructed = R_quant + W_svd
 
-            if visualization_path:
+            if True:
                 create_and_save_layer_heatmaps(
                     layer_name=peft_layer_name,
                     output_path=visualization_path,
                     w_original_tensor=W_original,
                     r_true_tensor=R_true,
                     r_quant_tensor=R_quant
+                )
+                # Holen Sie den Rang direkt aus dem PEFT-Layer-Objekt
+                rank = peft_layer.r[adapter_name]
+                visualize_svd_components(
+                    layer_name=peft_layer_name,
+                    output_path=svd_visualization_path,
+                    w_original_tensor=W_original,
+                    rank=rank
                 )
 
             svd_error_tensor = W_original - W_svd
@@ -503,12 +515,12 @@ def create_and_save_layer_heatmaps(
 
     # Plot 2: Wahres Residuum
     axes[1].imshow(true_residual_matrix, cmap=cmap, norm=log_norm)
-    axes[1].set_title("2. Wahres Residuum (W - W_svd)")
+    axes[1].set_title("2. Wahres Residual W_res")
     axes[1].grid(False)
 
     # Plot 3: Quantisiertes Residuum
     axes[2].imshow(quant_residual_matrix, cmap=cmap, norm=log_norm)
-    axes[2].set_title("3. Quantisiertes Residuum (R_quant)")
+    axes[2].set_title("3. Quantisiertes Residual Q(W_res)")
     axes[2].grid(False)
 
     # Gemeinsame Farbleiste (wird jetzt nicht-linear sein)
@@ -520,6 +532,94 @@ def create_and_save_layer_heatmaps(
     safe_filename = layer_name.replace('.', '_') + "_log_scale.png"
     full_save_path = os.path.join(output_path, safe_filename)
     plt.savefig(full_save_path, dpi=150)
+    plt.close(fig)
+
+    
+def visualize_svd_components(
+    layer_name: str,
+    output_path: str,
+    w_original_tensor: torch.Tensor,
+    rank: int
+):
+    """
+    Führt eine SVD auf der Original-Gewichtsmatrix durch und visualisiert die
+    Komponenten S, U und Vh. Hebt die relativen Anteile der Singulärwerte hervor.
+    
+    Args:
+        layer_name: Name des Layers für Titel und Dateinamen.
+        output_path: Ordner zum Speichern des Bildes.
+        w_original_tensor: PyTorch-Tensor der Originalgewichte.
+        rank: Der LoRA-Rang, der für die Hervorhebung verwendet wird.
+    """
+    # --- Imports sind hier gekapselt ---
+    import os
+    import torch
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+
+    plt.switch_backend('Agg')
+
+    # --- Schritt 1: Volle SVD auf der CPU durchführen für die Analyse ---
+    # Wir führen die SVD auf der CPU durch, um GPU-Speicher zu schonen.
+    W_cpu = w_original_tensor.cpu()
+    U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
+    
+    s_np = S.numpy()
+
+    # --- Schritt 2: "Energie" und prozentualen Anteil berechnen ---
+    # Die "Energie" ist proportional zum Quadrat der Singulärwerte.
+    s_squared = s_np ** 2
+    total_energy = np.sum(s_squared)
+    kept_energy = np.sum(s_squared[:rank])
+    percentage_kept = (kept_energy / total_energy) * 100 if total_energy > 0 else 0
+
+    # --- Schritt 3: Matrizen U und Vh für Heatmaps vorbereiten (gekürzt) ---
+    U_r = U[:, :rank].numpy()
+    Vh_r = Vh[:rank, :].numpy()
+
+    # --- Schritt 4: Figur mit einem komplexen Grid-Layout für die Plots erstellen ---
+    fig = plt.figure(figsize=(18, 13))
+    gs = gridspec.GridSpec(2, 2, figure=fig, height_ratios=[1, 1])
+    
+    ax_s = fig.add_subplot(gs[0, :])  # Oberer Plot erstreckt sich über die ganze Breite
+    ax_u = fig.add_subplot(gs[1, 0])  # Unterer linker Plot
+    ax_vh = fig.add_subplot(gs[1, 1]) # Unterer rechter Plot
+
+    fig.suptitle(f"SVD-Analyse für Layer: {layer_name}", fontsize=18, y=0.97)
+
+    # --- Plot 1: Singulärwerte (S) mit Hervorhebung ---
+    indices = np.arange(len(s_np))
+    ax_s.bar(indices, s_np, color='lightgray', label=f'Verworfene SVs (Rang > {rank})')
+    ax_s.bar(indices[:rank], s_np[:rank], color='cornflowerblue', label=f'Behaltene SVs (Rang <= {rank})')
+    
+    title_text = (f"Singulärwerte (S)\n"
+                  f"Die Top-{rank} SVs erfassen {percentage_kept:.2f}% der quadratischen Norm ('Energie')")
+    ax_s.set_title(title_text, fontsize=14)
+    ax_s.set_ylabel("Wert (log-skaliert)")
+    ax_s.set_xlabel("Index des Singulärwerts")
+    ax_s.set_yscale('log')
+    ax_s.legend()
+    ax_s.grid(True, which="both", ls="--", alpha=0.5)
+
+    # --- Plot 2: Linke Singulärvektoren (U_r) ---
+    ax_u.imshow(U_r, cmap='viridis', aspect='auto')
+    ax_u.set_title(f"Linke Vektoren (U_r), Shape: {U_r.shape}")
+    ax_u.set_xlabel("Rang-Dimension")
+    ax_u.set_ylabel("Original-Dimension")
+
+    # --- Plot 3: Rechte Singulärvektoren (Vh_r) ---
+    ax_vh.imshow(Vh_r, cmap='viridis', aspect='auto')
+    ax_vh.set_title(f"Rechte Vektoren (Vh_r), Shape: {Vh_r.shape}")
+    ax_vh.set_xlabel("Original-Dimension")
+    ax_vh.set_ylabel("Rang-Dimension")
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    # --- Schritt 5: Figur speichern ---
+    safe_filename = layer_name.replace('.', '_') + "_svd_analysis.png"
+    full_save_path = os.path.join(output_path, safe_filename)
+    plt.savefig(full_save_path, dpi=120) # DPI leicht reduziert für schnellere Speicherung
     plt.close(fig)
     
 def main():
@@ -577,7 +677,7 @@ def main():
     # Run evaluations
     print(f"\n🚀 Starting evaluation of {len(all_models)} models...")
     all_results = []
-    
+    all_models = all_models[:1] 
     for i, model_info in enumerate(all_models, 1):
         print(f"\n{'='*60}")
         print(f"🏁 EVALUATING MODEL {i}/{len(all_models)}")

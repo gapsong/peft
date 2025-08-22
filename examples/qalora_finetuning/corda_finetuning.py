@@ -554,7 +554,7 @@ def train():
         peft_model.save_pretrained(adapter_path)
 
         # Save the residual base model temporarily
-        temp_residual_path = os.path.join(script_args.output_dir, f"temp_residual_base_r{script_args.lora_r}_fp16")
+        temp_residual_path = os.path.join(script_args.output_dir, f"{model_name_clean}_residual_base_r{script_args.lora_r}_fp16")
         
         # 🚀 EINFACHSTE LÖSUNG: Direkte State Dict Extraktion
         print("🚀 Verwende direkte State Dict Methode...")
@@ -608,10 +608,10 @@ def train():
         # Phase 4: Quantize W_res with different bit configurations
         quantization_configs = [
             {"bits": 2, "group_size": 32},
-            {"bits": 2, "group_size": 64},  # Different group size for comparison
-            {"bits": 2, "group_size": 128},
-            # {"bits": 3, "group_size": 32},
-            # {"bits": 4, "group_size": 32},
+            # {"bits": 2, "group_size": 64},  # Different group size for comparison
+            # {"bits": 2, "group_size": 128},
+            {"bits": 3, "group_size": 32},
+            {"bits": 4, "group_size": 32},
             # {"bits": 4, "group_size": 64},  # Different group size for comparison
             # {"bits": 4, "group_size": 128},
         ]
