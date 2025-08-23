@@ -367,7 +367,7 @@ class LoraLayer(BaseTunerLayer):
         rank = self.r[adapter_name]
 
         # 2. Hole die Gewichte und prüfe die Form
-        weight = self.get_base_layer().weight.clone().to(torch.flwoat32)
+        weight = self.get_base_layer().weight.clone().to(torch.float32)
         weight_for_svd = weight.clone().to(torch.float32)
         print(weight_for_svd.shape)
         needs_transpose = False

@@ -637,6 +637,32 @@ def train():
                 model1_name="Extracted Residual Model", 
                 model2_name="Reloaded Model"
             )
+       
+        print("\n🧹 Aggressive Speicherbereinigung vor der Quantisierung...")
+        
+        # Überprüfe, ob die Variablen existieren, bevor sie gelöscht werden
+        # (falls wir aus dem Cache-Pfad kommen, existieren sie nicht)
+        if 'peft_model' in locals():
+            del peft_model
+        if 'model' in locals():
+            del model
+        if 'peft_base_model' in locals():
+            del peft_base_model
+        if 'base_state_dict' in locals():
+            del base_state_dict
+        if 'clean_state_dict' in locals():
+            del clean_state_dict
+        if 'residual_model' in locals():
+            del residual_model
+        if 'reloaded_model_loaded' in locals():
+            del reloaded_model_loaded
+        
+        # Leere den CUDA-Cache, um den Speicher wirklich freizugeben
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        print("✅ Speicherbereinigung abgeschlossen. Starte Quantisierung...")
+       
         
         # --- CACHING LOGIC END ---
 
@@ -701,6 +727,13 @@ def train():
                 quantized_model.save_pretrained(quantized_path)
                 tokenizer.save_pretrained(quantized_path)
 
+                if isinstance(target_modules, set):
+                    print("🔧 Konvertiere 'target_modules' von 'set' zu 'list' für die JSON-Speicherung.")
+                    serializable_target_modules = list(target_modules)
+                else:
+                    serializable_target_modules = target_modules
+                # --- ENDE DES FIXES ---
+
                 # Save metadata about this quantization
                 metadata = {
                     "base_model": temp_residual_path,
@@ -716,7 +749,7 @@ def train():
                         "true_sequential": True,
                         "actorder": True,
                     },
-                    "target_modules": target_modules,
+                    "target_modules": serializable_target_modules,  # Verwende die bereinigte Liste
                     "adapter_path": adapter_path,
                 }
 
