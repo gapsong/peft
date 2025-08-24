@@ -25,7 +25,331 @@ import transformers
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig, GPTQConfig, Trainer
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+from safetensors.torch import load_file
+from eval_peft import load_model_and_tokenizer
+import json
 
+def unpack_qweight2(qweight: torch.Tensor, bits: int) -> torch.Tensor:
+    """
+    Entpackt einen GPTQ-komprimierten qweight-Tensor in einzelne Integer-Werte.
+    """
+    if 32 % bits != 0:
+        raise NotImplementedError(f"Reines Python-Entpacken für {bits}-Bit wird nicht unterstützt, da 32 nicht durch {bits} teilbar ist.")
+    
+    pack_factor = 32 // bits
+    mask = (1 << bits) - 1
+
+    unpacked = torch.zeros(
+        (qweight.shape[0]* pack_factor, qweight.shape[1] ),
+        dtype=torch.int8,  # Verwende int8, um sicher zu sein
+        device=qweight.device
+    )
+    for j in range(pack_factor):
+        shift = bits * j
+        unpacked[j :: pack_factor, :] = (qweight >> shift) & mask
+
+    return unpacked
+
+def unpack_qweight(qweight: torch.Tensor, bits: int) -> torch.Tensor:
+    """
+    Entpackt einen GPTQ-komprimierten qweight-Tensor basierend auf der originalen GPTQ-Logik.
+    Folgt exakt der dequantize_weight Implementierung.
+    """
+    if bits in [2, 4, 8]:
+        # Standard unpacking for 2, 4, 8 bit
+        pack_factor = 32 // bits
+        maxq = (1 << bits) - 1
+        
+        # Create shift patterns (equivalent to wf_unsqueeze_neg_one)
+        wf = torch.arange(0, pack_factor * bits, bits, dtype=torch.int32, device=qweight.device)
+        wf_unsqueeze_neg_one = wf.unsqueeze(-1)  # Shape: (pack_factor, 1)
+        
+        # Unpack weights following the exact GPTQ logic
+        weight = torch.bitwise_and(
+            torch.bitwise_right_shift(
+                torch.unsqueeze(qweight, 1).expand(-1, pack_factor, -1),
+                wf_unsqueeze_neg_one  # self.wf.unsqueeze(-1)
+            ).to(torch.int32),
+            maxq,
+        )
+        
+    elif bits == 3:
+        # Special handling for 3-bit quantization - exact copy from GPTQ
+        wf = torch.tensor([0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 0], dtype=torch.int32, device=qweight.device)
+        wf_unsqueeze_neg_one = wf.unsqueeze(-1)
+        
+        weight = qweight.reshape(
+            qweight.shape[0] // 3, 3, 1, qweight.shape[1]
+        ).expand(-1, -1, 12, -1)
+        
+        weight = (weight >> wf_unsqueeze_neg_one) & 0x7  # self.wf.unsqueeze(-1)
+        
+        # Handle special cases for 3-bit packing
+        weight[:, 0, 10] = (weight[:, 0, 10] & 0x3) | ((weight[:, 1, 0] << 2) & 0x4)
+        weight[:, 1, 11] = (weight[:, 1, 11] & 0x1) | ((weight[:, 2, 0] << 1) & 0x6)
+        weight = weight & 0x7
+        
+        weight = torch.cat(
+            [weight[:, 0, :11], weight[:, 1, 1:12], weight[:, 2, 1:11]], dim=1
+        )
+    else:
+        raise NotImplementedError(f"Bits {bits} not supported")
+    
+    # Final reshape to match expected output format
+    # weight.shape is currently (groups, pack_factor, out_features) or similar
+    # We need to flatten it to (in_features, out_features)
+    weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
+    
+    return weight
+
+# filepath: /home/nudel/Documents/peft/examples/qalora_finetuning/corda_finetuning.py
+# Replace the existing unpack_qweight function with this one
+
+def unpack_qzeros(qzeros: torch.Tensor, bits: int, group_size: int = 32) -> torch.Tensor:
+    """
+    Entpackt einen GPTQ-komprimierten qzeros-Tensor basierend auf der originalen GPTQ-Logik.
+    """
+    if bits in [2, 4, 8]:
+        # Standard unpacking for 2, 4, 8 bit
+        pack_factor = 32 // bits
+        maxq = (1 << bits) - 1
+        
+        # Create shift patterns (equivalent to wf_unsqueeze_zero)
+        wf = torch.arange(0, pack_factor * bits, bits, dtype=torch.int32, device=qzeros.device)
+        wf_unsqueeze_zero = wf.unsqueeze(0)  # Shape: (1, pack_factor)
+        
+        # Expand qzeros and apply bit shifts
+        zeros = torch.bitwise_right_shift(
+            torch.unsqueeze(qzeros, 2).expand(-1, -1, pack_factor),
+            wf_unsqueeze_zero.unsqueeze(0)  # Broadcast to match dimensions
+        ).to(torch.int32)
+        
+        # Apply mask and reshape
+        zeros = torch.bitwise_and(zeros, maxq)
+        # Reshape to match the expected output format
+        zeros = zeros.reshape(qzeros.shape[0], qzeros.shape[1] * pack_factor)
+        
+    elif bits == 3:
+        # Special handling for 3-bit quantization
+        wf = torch.tensor([0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 0], dtype=torch.int32, device=qzeros.device)
+        wf_unsqueeze_zero = wf.unsqueeze(0)
+        
+        zeros = qzeros.reshape(
+            qzeros.shape[0], qzeros.shape[1] // 3, 3, 1
+        ).expand(-1, -1, -1, 12)
+        
+        zeros = zeros >> wf_unsqueeze_zero.unsqueeze(0).unsqueeze(0)
+        
+        # Handle special cases for 3-bit packing
+        zeros[:, :, 0, 10] = (zeros[:, :, 0, 10] & 0x3) | (
+            (zeros[:, :, 1, 0] << 2) & 0x4
+        )
+        zeros[:, :, 1, 11] = (zeros[:, :, 1, 11] & 0x1) | (
+            (zeros[:, :, 2, 0] << 1) & 0x6
+        )
+        zeros = zeros & 0x7
+        
+        zeros = torch.cat(
+            [zeros[:, :, 0, :11], zeros[:, :, 1, 1:12], zeros[:, :, 2, 1:11]],
+            dim=2,
+        )
+        
+        # Reshape to final format
+        zeros = zeros.reshape(qzeros.shape[0], -1)
+    else:
+        raise NotImplementedError(f"Bits {bits} not supported")
+    
+    return zeros
+
+def pack_qweight(unpacked_qweight: torch.Tensor, bits: int) -> torch.Tensor:
+    """
+    Packt einen Tensor von Integer-Werten zurück in einen GPTQ-komprimierten qweight-Tensor.
+    Basiert auf der originalen GPTQ pack-Funktion.
+    """
+    # Convert to numpy for bit manipulation (following original implementation)
+    int_weight = unpacked_qweight.contiguous().cpu().numpy().astype(np.uint32)
+    pack_dtype_bits = 32
+    # Calculate pack factor
+    if bits in [2, 4, 8]:
+        pack_factor = 32 // bits
+    elif bits == 3:
+        pack_factor = 32 // 3  # This will be handled specially
+    else:
+        raise ValueError(f"Unsupported bits: {bits}")
+    
+    if bits in [2, 4, 8]:
+        qweight = np.zeros(
+            ((int_weight.shape[0] // pack_dtype_bits) * bits, int_weight.shape[1]),
+            dtype=np.uint32,
+        )
+        for row in range(qweight.shape[0]):
+            for j in range(pack_factor):
+                qweight[row] |= int_weight[row * pack_factor + j] << (bits * j)
+                
+    elif bits == 3:
+        qweight = np.zeros(
+            (int_weight.shape[0] // 32 * 3, int_weight.shape[1]),
+            dtype=np.uint32,
+        )
+        i = 0
+        row = 0
+        while row < qweight.shape[0]:
+            for j in range(i, i + 10):
+                qweight[row] |= int_weight[j] << (3 * (j - i))
+            i += 10
+            qweight[row] |= int_weight[i] << 30
+            row += 1
+            qweight[row] |= (int_weight[i] >> 2) & 1
+            i += 1
+            for j in range(i, i + 10):
+                qweight[row] |= int_weight[j] << (3 * (j - i) + 1)
+            i += 10
+            qweight[row] |= int_weight[i] << 31
+            row += 1
+            qweight[row] |= (int_weight[i] >> 1) & 0x3
+            i += 1
+            for j in range(i, i + 10):
+                qweight[row] |= int_weight[j] << (3 * (j - i) + 2)
+            i += 10
+            row += 1
+
+    return torch.from_numpy(qweight.astype(np.int32)).to(unpacked_qweight.device)
+
+def reconstruct_low_rank_update_from_adapter(adapter_path: str):
+    """
+    Lädt einen gespeicherten LoRA-Adapter, extrahiert lora_A und lora_B,
+    berechnet den Skalierungsfaktor und rekonstruiert die Low-Rank-Update-Matrix.
+    """
+    # 1. Pfade zur Konfigurations- und Gewichtsdatei definieren
+    config_path = os.path.join(adapter_path, "adapter_config.json")
+    weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
+
+    if not os.path.exists(config_path) or not os.path.exists(weights_path):
+        print(f"❌ Fehler: Konnte 'adapter_config.json' oder 'adapter_model.safetensors' nicht in {adapter_path} finden.")
+        return
+
+    # 2. Konfiguration laden, um 'r' und 'lora_alpha' zu erhalten
+    print(f"🔍 Lade Konfiguration von: {config_path}")
+    with open(config_path, "r") as f:
+        adapter_config = json.load(f)
+
+    r = adapter_config.get("r")
+    lora_alpha = adapter_config.get("lora_alpha")
+    use_rslora = adapter_config.get("use_rslora", False)
+
+    if r is None or lora_alpha is None:
+        print("❌ Fehler: 'r' oder 'lora_alpha' nicht in der Konfiguration gefunden.")
+        return
+
+    # 3. Den 'scaling'-Parameter berechnen
+    if use_rslora:
+        scaling = lora_alpha / torch.sqrt(torch.tensor(r))
+        print(f"✅ Konfiguration geladen: r={r}, lora_alpha={lora_alpha} (rsLoRA-Skalierung verwendet)")
+    else:
+        scaling = lora_alpha / r
+        print(f"✅ Konfiguration geladen: r={r}, lora_alpha={lora_alpha}")
+    
+    print(f"   Berechneter Skalierungsfaktor: {scaling:.4f}\n")
+
+    # 4. Das State Dictionary des Adapters laden
+    print(f"🔍 Lade Gewichte von: {weights_path}")
+    adapter_state_dict = load_file(weights_path)
+    print(f"✅ {len(adapter_state_dict)} Tensoren geladen.\n")
+
+    # 5. Durch alle Layer iterieren und die Low-Rank-Matrix rekonstruieren
+    reconstructed_matrices = {}
+    
+    # Finde alle lora_A Gewichte, um die Layer zu identifizieren
+    lora_a_keys = [key for key in adapter_state_dict if key.endswith(".lora_A.weight")]
+
+    for lora_a_key in lora_a_keys:
+        base_key = lora_a_key.replace(".lora_A.weight", "")
+        lora_b_key = base_key + ".lora_B.weight"
+
+        if lora_b_key in adapter_state_dict:
+            lora_A = adapter_state_dict[lora_a_key]
+            lora_B = adapter_state_dict[lora_b_key]
+            
+            # Dies ist die Kernlogik Ihrer Anfrage
+            # LR = scaling * (B @ A)
+            low_rank_update = scaling * (lora_B @ lora_A)
+            
+            reconstructed_matrices[base_key] = low_rank_update
+            
+            print(f"--- Rekonstruiert für Layer: {base_key} ---")
+            print(f"  - lora_A Form: {lora_A.shape}")
+            print(f"  - lora_B Form: {lora_B.shape}")
+            print(f"  - Rekonstruierte LR-Matrix Form: {low_rank_update.shape}\n")
+
+    return reconstructed_matrices
+
+def inspect_quantized_safetensors(model_path: str):
+    """
+    Loads a quantized safetensors file and prints the details of the 
+    quantized parameters (qweight, qzeros, scales) for the first found layer.
+    """
+    # The standard name for the weights file is 'model.safetensors'
+    safetensors_file = os.path.join(model_path, "model.safetensors")
+
+    if not os.path.exists(safetensors_file):
+        # Fallback for older pytorch .bin format
+        safetensors_file = os.path.join(model_path, "pytorch_model.bin")
+        if not os.path.exists(safetensors_file):
+            print(f"❌ Error: Could not find 'model.safetensors' or 'pytorch_model.bin' in {model_path}")
+            return
+
+    print(f"🔍 Loading state dictionary from: {safetensors_file}")
+    
+    # Use the safetensors library to load the file into a dictionary
+    state_dict = load_file(safetensors_file)
+    
+    print(f"✅ Successfully loaded {len(state_dict)} tensors.\n")
+    
+    # --- Find and inspect a quantized linear layer ---
+    
+    found_layer = False
+    for key, tensor in state_dict.items():
+        # Quantized weights are typically named with a '.qweight' suffix
+        if key.endswith(".qweight"):
+            print(f"--- Found Quantized Layer: {key.replace('.qweight', '')} ---")
+            
+            # --- Accessing qweight ---
+            qweight_tensor = tensor
+            print(f"  - qweight tensor '{key}':")
+            print(f"    - Shape: {qweight_tensor.shape}")
+            print(f"    - Dtype: {qweight_tensor.dtype}")
+            print(f"    - First 5 values: {qweight_tensor.flatten()[:5]}")
+            
+            # Derive the names of the other related tensors
+            base_key = key.replace('.qweight', '')
+            qzeros_key = f"{base_key}.qzeros"
+            scales_key = f"{base_key}.scales"
+            
+            # --- Accessing qzeros ---
+            if qzeros_key in state_dict:
+                qzeros_tensor = state_dict[qzeros_key]
+                print(f"\n  - qzeros tensor '{qzeros_key}':")
+                print(f"    - Shape: {qzeros_tensor.shape}")
+                print(f"    - Dtype: {qzeros_tensor.dtype}")
+                print(f"    - First 5 values: {qzeros_tensor.flatten()[:5]}")
+            else:
+                print(f"\n  - qzeros tensor for {base_key} not found.")
+
+            # --- Accessing scales ---
+            if scales_key in state_dict:
+                scales_tensor = state_dict[scales_key]
+                print(f"\n  - scales tensor '{scales_key}':")
+                print(f"    - Shape: {scales_tensor.shape}")
+                print(f"    - Dtype: {scales_tensor.dtype}")
+                print(f"    - First 5 values: {scales_tensor.flatten()[:5]}")
+            else:
+                print(f"\n  - scales tensor for {base_key} not found.")
+
+            found_layer = True
+            break # Stop after inspecting the first layer
+
+    if not found_layer:
+        print("❌ No quantized layers (ending in .qweight) were found in the file.")
 
 IGNORE_INDEX = -100
 
@@ -604,8 +928,8 @@ def train():
             peft_base_model = peft_model.get_base_model().to(torch.bfloat16)
             base_state_dict = peft_base_model.state_dict()
             clean_state_dict = {}
-            
-            for key, value in base_state_dict.items():
+
+            for key, value in base_state_dict.items(): # converts peft_names to hf model names
                 if "base_layer.weight" in key:
                     clean_key = key.replace(".base_layer.weight", ".weight")
                     clean_state_dict[clean_key] = value.clone()
@@ -637,13 +961,11 @@ def train():
                 model1_name="Extracted Residual Model", 
                 model2_name="Reloaded Model"
             )
-       
+
         print("\n🧹 Aggressive Speicherbereinigung vor der Quantisierung...")
         
         # Überprüfe, ob die Variablen existieren, bevor sie gelöscht werden
         # (falls wir aus dem Cache-Pfad kommen, existieren sie nicht)
-        if 'peft_model' in locals():
-            del peft_model
         if 'model' in locals():
             del model
         if 'peft_base_model' in locals():
@@ -662,7 +984,7 @@ def train():
             torch.cuda.empty_cache()
         
         print("✅ Speicherbereinigung abgeschlossen. Starte Quantisierung...")
-       
+
         
         # --- CACHING LOGIC END ---
 
@@ -678,115 +1000,190 @@ def train():
         ]
         quantized_models_info = []
 
+        # --- START OF CUSTOM RE-QUANTIZATION LOGIC ---
         for i, qconfig in enumerate(quantization_configs):
             bits = qconfig["bits"]
             group_size = qconfig["group_size"]
 
             print(f"\n{'=' * 60}")
-            print(f"Quantizing W_res [{i + 1}/{len(quantization_configs)}]: {bits}-bit, group_size={group_size}")
+            print(f"Custom Re-Quantizing [{i + 1}/{len(quantization_configs)}]: {bits}-bit, group_size={group_size}")
             print(f"{'=' * 60}")
 
-            # Create unique name for this quantization
-            quantized_name = f"w_res_{model_name_clean}_r{script_args.lora_r}_daniel_{bits}bit_gs{group_size}"
-            quantized_path = os.path.join(base_output_dir, quantized_name)
+            model_name_clean = script_args.model_name_or_path.replace("/", "_").replace("\\", "_")
+            quantized_path = os.path.join(base_output_dir, f"quantized_W_res_{bits}bit_gs{group_size}_{model_name_clean}")
 
-            # Skip if already exists
             if os.path.exists(quantized_path) and os.path.exists(os.path.join(quantized_path, "config.json")):
                 print(f"⏭️  Quantized model already exists: {quantized_path}")
-                quantized_models_info.append(
-                    {
-                        "bits": bits,
-                        "group_size": group_size,
-                        "quantized_path": quantized_path,
-                        "adapter_path": adapter_path,
-                        "status": "exists",
-                    }
-                )
+                quantized_models_info.append({"status": "existing", "bits": bits, "group_size": group_size, "quantized_path": quantized_path})
                 continue
 
-            try:
-                # Configure GPTQ with current settings
-                gptq_config = GPTQConfig(
-                    bits=bits,
-                    dataset="c4",
-                    tokenizer=tokenizer,
-                    group_size=group_size,
-                    desc_act=False,
-                    sym=False,
-                    static_groups=False,
-                    true_sequential=True,
-                    actorder=True,
-                )
-
-                print(f"Loading residual model for {bits}-bit quantization...")
-                quantized_model = AutoModelForCausalLM.from_pretrained(
-                    temp_residual_path, device_map="auto", quantization_config=gptq_config, torch_dtype=torch.float16
-                )
-
-                print(f"Saving {bits}-bit quantized W_res to: {quantized_path}")
-                quantized_model.save_pretrained(quantized_path)
-                tokenizer.save_pretrained(quantized_path)
-
-                if isinstance(target_modules, set):
-                    print("🔧 Konvertiere 'target_modules' von 'set' zu 'list' für die JSON-Speicherung.")
-                    serializable_target_modules = list(target_modules)
-                else:
-                    serializable_target_modules = target_modules
-                # --- ENDE DES FIXES ---
-
-                # Save metadata about this quantization
-                metadata = {
-                    "base_model": temp_residual_path,
-                    "lora_rank": script_args.lora_r,
-                    "lora_alpha": 2 * script_args.lora_r,
-                    "initialization": False,
-                    "quantization": {
-                        "bits": bits,
-                        "group_size": group_size,
-                        "desc_act": False,
-                        "sym": False,
-                        "static_groups": False,
-                        "true_sequential": True,
-                        "actorder": True,
-                    },
-                    "target_modules": serializable_target_modules,  # Verwende die bereinigte Liste
-                    "adapter_path": adapter_path,
-                }
-
-                with open(os.path.join(quantized_path, "quantization_metadata.json"), "w") as f:
-                    import json
-
-                    json.dump(metadata, f, indent=2)
-
-                quantized_models_info.append(
-                    {
-                        "bits": bits,
-                        "group_size": group_size,
-                        "quantized_path": quantized_path,
-                        "adapter_path": adapter_path,
-                        "status": "created",
-                    }
-                )
-
-                # Clean up memory
-                del quantized_model
+            # Lade die Quantisierungsparameter von W_q und die LR-Matrizen
+            quantized_path_base_model = os.path.join(base_output_dir, f"quantized_base_model_{model_name_clean}_{bits}bit_gs{group_size}")
+            if not os.path.exists(quantized_path_base_model):
+                 # Erstelle das quantisierte Basismodell, falls es nicht existiert
+                print(f"Quantisiere das Basismodell für {bits}-bit, gs={group_size}...")
+                gptq_config_base = GPTQConfig(bits=bits, dataset="c4", tokenizer=tokenizer, group_size=group_size, desc_act=False, sym=False, static_groups=False, true_sequential=True, actorder=True)
+                quantized_base_model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path, device_map="auto", quantization_config=gptq_config_base, torch_dtype=torch.float16)
+                quantized_base_model.save_pretrained(quantized_path_base_model)
+                del quantized_base_model
                 torch.cuda.empty_cache()
 
-                print(f"✅ {bits}-bit quantization complete!")
+            state_dict_Wq = load_file(f"{quantized_path_base_model}/model.safetensors")
+            LR_matrices = reconstruct_low_rank_update_from_adapter(adapter_path)
+            
+            clean_state_dict_lr = {}
+            for key, value in LR_matrices.items():
+                if "base_model.model" in key:
+                    clean_key = key.replace("base_model.model.", "")
+                    clean_state_dict_lr[clean_key] = value.clone()
 
-            except Exception as e:
-                print(f"❌ Failed to quantize with {bits}-bit, group_size={group_size}: {e}")
-                quantized_models_info.append(
-                    {
-                        "bits": bits,
-                        "group_size": group_size,
-                        "quantized_path": None,
-                        "adapter_path": adapter_path,
-                        "status": "failed",
-                        "error": str(e),
+            print(f"✅ Loaded {len(state_dict_Wq)} tensors from W_q and {len(clean_state_dict_lr)} LR matrices.")
+
+            final_state_dict = {}
+            
+            for layer_name, LR_matrix in clean_state_dict_lr.items():
+                print(f"  - Processing layer: {layer_name}")
+                
+                # Hole die originalen quantisierten Parameter
+                qweight = state_dict_Wq[f"{layer_name}.qweight"]
+                qzeros = state_dict_Wq[f"{layer_name}.qzeros"]
+                scales = state_dict_Wq[f"{layer_name}.scales"]
+                
+                # GPTQModel speichert die Gewichte transponiert. Wir müssen die LR-Matrix anpassen.
+                LR_matrix_T = LR_matrix.T.contiguous()
+
+                unpacked_qweight = unpack_qweight(qweight, bits)
+                unpacked_qzeros = unpack_qzeros(qzeros, bits)
+
+                scales_expanded = scales.repeat_interleave(group_size, dim=0)
+                unpacked_qzeros_expanded = unpacked_qzeros.repeat_interleave(group_size, dim=0)
+
+                assert unpacked_qweight.shape == LR_matrix_T.shape, f"Shape mismatch: W_q.T {unpacked_qweight.shape} vs LR.T {LR_matrix_T.shape}"
+                assert scales_expanded.shape == unpacked_qweight.shape, f"Shape mismatch: Scales {scales_expanded.shape} vs W_q.T {unpacked_qweight.shape}"
+                assert unpacked_qzeros_expanded.shape == unpacked_qweight.shape, f"Shape mismatch: Zeros {unpacked_qzeros_expanded.shape} vs W_q.T {unpacked_qweight.shape}"
+
+                dtype = scales.dtype
+                unpacked_qweight_float = unpacked_qweight.to(dtype)
+                unpacked_qzeros_float = unpacked_qzeros_expanded.to(dtype)
+                
+                reconstructed_W = (unpacked_qweight_float - unpacked_qzeros_float) * scales_expanded
+
+                reconstructed_W_res = reconstructed_W - LR_matrix_T.to(dtype)
+                
+                # Re-quantisiere mit den *alten* scales und zeros
+                # new_q_float = (W_res / scale) + qzero
+                new_qweight_float_requant = torch.round(reconstructed_W_res / scales_expanded) + unpacked_qzeros_float
+
+                # 4. Clippe und packe die neuen Gewichte wieder zusammen
+                max_val = (1 << bits) - 1
+                new_qweight_clipped = torch.clamp(new_qweight_float_requant, 0, max_val).to(torch.int32)
+                
+                new_qweight_packed = pack_qweight(new_qweight_clipped, bits)
+                
+                final_state_dict[f"{layer_name}.qweight"] = new_qweight_packed
+                final_state_dict[f"{layer_name}.qzeros"] = qzeros # Behalte die originalen gepackten qzeros
+                final_state_dict[f"{layer_name}.scales"] = scales # Behalte die originalen scales
+
+
+            # Füge alle nicht-modifizierten Tensoren hinzu
+            for key, value in state_dict_Wq.items():
+                if key not in final_state_dict:
+                    final_state_dict[key] = value
+            
+            print("\n✅ Re-quantization complete. Comparing changes...")
+            
+            # Load the original quantized model to compare against
+            original_model = AutoModelForCausalLM.from_pretrained(quantized_path_base_model, device_map="auto")
+            original_state_dict = original_model.state_dict()
+            
+            # Compare qweight changes layer by layer
+            total_qweights = 0
+            total_changed = 0
+            layer_changes = {}
+            
+            for layer_name in clean_state_dict_lr.keys():
+                qweight_key = f"{layer_name}.qweight"
+                if qweight_key in original_state_dict and qweight_key in final_state_dict:
+                    original_qweight = original_state_dict[qweight_key]
+                    new_qweight = final_state_dict[qweight_key]
+                    
+                    # Ensure tensors are on the same device
+                    if original_qweight.device != new_qweight.device:
+                        new_qweight = new_qweight.to(original_qweight.device)
+                    
+                    # Count total elements
+                    layer_total = original_qweight.numel()
+                    total_qweights += layer_total
+                    
+                    # Count changed elements
+                    changed_mask = (original_qweight != new_qweight)
+                    layer_changed = changed_mask.sum().item()
+                    total_changed += layer_changed
+                    
+                    # Calculate percentage for this layer
+                    layer_percentage = (layer_changed / layer_total) * 100 if layer_total > 0 else 0
+                    
+                    layer_changes[layer_name] = {
+                        "total": layer_total,
+                        "changed": layer_changed,
+                        "percentage": layer_percentage
                     }
-                )
-                continue
+                    
+                    print(f"  - {layer_name}: {layer_changed}/{layer_total} qweights changed ({layer_percentage:.2f}%)")
+            
+            # Overall statistics
+            overall_percentage = (total_changed / total_qweights) * 100 if total_qweights > 0 else 0
+            
+            print(f"\n📊 QUANTIZATION IMPACT SUMMARY:")
+            print(f"  - Total qweights analyzed: {total_qweights:,}")
+            print(f"  - Total qweights changed: {total_changed:,}")
+            print(f"  - Overall change percentage: {overall_percentage:.2f}%")
+            print(f"  - Layers processed: {len(layer_changes)}")
+            
+            # Show top 5 most changed layers
+            if layer_changes:
+                sorted_layers = sorted(layer_changes.items(), key=lambda x: x[1]['percentage'], reverse=True)
+                print(f"\n🔥 Top 5 most impacted layers:")
+                for i, (layer_name, stats) in enumerate(sorted_layers[:5]):
+                    print(f"  {i+1}. {layer_name}: {stats['percentage']:.2f}% changed")
+            
+            # Clean up original model to free memory
+            del original_model, original_state_dict
+            torch.cuda.empty_cache()
+            
+            # Now load the final model and apply the new state dict
+            print("\n🔄 Loading final model with modified qweights...")
+            final_model = AutoModelForCausalLM.from_pretrained(quantized_path_base_model, device_map="auto")
+            final_model.load_state_dict(final_state_dict, strict=True)
+            
+            # Speichere das Endergebnis
+            os.makedirs(quantized_path, exist_ok=True)
+            final_model.save_pretrained(quantized_path)
+            tokenizer.save_pretrained(quantized_path)
+            
+            # Add the comparison results to the quantized model info
+            quantized_models_info.append({
+                "status": "created", 
+                "bits": bits, 
+                "group_size": group_size, 
+                "quantized_path": quantized_path,
+                "qweight_changes": {
+                    "total_qweights": total_qweights,
+                    "changed_qweights": total_changed,
+                    "change_percentage": overall_percentage,
+                    "most_impacted_layer": sorted_layers[0][0] if sorted_layers else None,
+                    "max_layer_change_percentage": sorted_layers[0][1]['percentage'] if sorted_layers else 0
+                }
+            })
+            
+            # Speicherbereinigung
+            del final_model, state_dict_Wq, LR_matrices, clean_state_dict_lr, final_state_dict
+            torch.cuda.empty_cache()
+
+            print(f"✅ {bits}-bit quantization complete!")
+
+            # --- old quantization code end ---
+
 
         # Phase 5: Save summary of all quantized models
         summary = {
