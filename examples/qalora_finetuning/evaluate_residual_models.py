@@ -187,7 +187,7 @@ def evaluate_residual_model(
         
         # Load model
         model, tokenizer = load_model_and_tokenizer(adapter_path, base_model_path)
-       
+        
         prefix = "/home/nudel/Documents/peft/visualizations"
         errors = calculate_reconstruction_errors(adapter_path, model, visualization_path=f"{prefix}/layer_heatmaps_rank_16", svd_visualization_path=f"{prefix}/svd_heatmaps_rank_16")
         svd_error = errors.get('svd_error', 0.0)
@@ -207,6 +207,26 @@ def evaluate_residual_model(
        
         limit = 100
         # Run evaluation
+        # from transformers import GPTQConfig 
+        # gptq_config = GPTQConfig(
+        #     bits=2,
+        #     dataset="c4",
+        #     tokenizer=tokenizer,
+        #     group_size=32,
+        #     desc_act=False,
+        #     sym=False,
+        #     static_groups=False,
+        #     true_sequential=True,
+        #     actorder=True,
+        # )
+        
+        # quantize_model_directly = AutoModelForCausalLM.from_pretrained(
+        #     "TinyLlama/TinyLlama_v1.1",
+        #     low_cpu_mem_usage=True,
+        #     quantization_config=gptq_config,
+        #     torch_dtype=torch.float32
+        # )
+        
         results = evaluate_with_lm_eval(
             model=model,
             tokenizer=tokenizer,
@@ -422,22 +442,34 @@ def calculate_reconstruction_errors(
             R_true = W_original - W_svd
             W_reconstructed = R_quant + W_svd
 
-            if False:
+            if True:
+                rank = peft_layer.r[adapter_name]  # vorhandener LoRA-Rang
+
                 create_and_save_layer_heatmaps(
                     layer_name=peft_layer_name,
                     output_path=visualization_path,
                     w_original_tensor=W_original,
                     r_true_tensor=R_true,
-                    r_quant_tensor=R_quant
+                    r_quant_tensor=R_quant,
+                    rank=rank  # sorgt für automatische W_svd-Berechnung/Visualisierung
                 )
-                # Holen Sie den Rang direkt aus dem PEFT-Layer-Objekt
-                rank = peft_layer.r[adapter_name]
+                coverage_ranks = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+                rank = peft_layer.r[adapter_name]  # falls du die Heatmaps auch willst
                 visualize_svd_components(
                     layer_name=peft_layer_name,
                     output_path=svd_visualization_path,
                     w_original_tensor=W_original,
-                    rank=rank
+                    rank=rank,                      # oder None, wenn nur die zwei SVD-Plots gewünscht sind
+                    coverage_ranks=coverage_ranks
                 )
+
+                # visualize_svd_coverage(
+                #     layer_name=peft_layer_name,
+                #     output_path=svd_visualization_path,
+                #     w_original_tensor=W_original,
+                #     ranks=coverage_ranks
+                # )
 
             svd_error_tensor = W_original - W_svd
             quant_error_tensor = R_true - R_quant
@@ -469,17 +501,30 @@ def create_and_save_layer_heatmaps(
     w_original_tensor: torch.Tensor,
     r_true_tensor: torch.Tensor,
     r_quant_tensor: torch.Tensor,
-    log_scale_threshold: float = 1e-3  # Schwellenwert für den linearen Bereich um Null
+    log_scale_threshold: float = 1e-3,  # Schwellenwert für den linearen Bereich um Null
+    w_svd_tensor: Optional[torch.Tensor] = None,
+    rank: Optional[int] = None
 ):
     """
-    Erstellt und speichert eine verbesserte Heatmap mit SymLogNorm,
-    um die Struktur trotz Ausreißern sichtbar zu machen.
-    
+    Erstellt und speichert Heatmaps mit SymLogNorm:
+      - W_original
+      - W_svd (Top-r SVD-Approx., wenn w_svd_tensor übergeben oder rank gesetzt ist)
+      - W_res (wahres Residuum)
+      - Q(W_res) (quantisiertes Residuum)
+      - Q(W_res) + W_svd (rekonstruierte Matrix)
+
+    Wenn w_svd_tensor fehlt und rank gesetzt ist, wird W_svd aus W_original per
+    truncierter SVD auf der CPU berechnet.
+
     Args:
-        ... (Parameter sind die gleichen wie zuvor) ...
-        log_scale_threshold: Der Bereich um Null, der linear bleibt. Kleinere Werte 
-                             zeigen mehr Details, können aber bei zu viel Rauschen
-                             überladen wirken. Ein guter Startwert ist 1e-3.
+        layer_name: Layer-Name für Titel/Dateiname.
+        output_path: Zielordner.
+        w_original_tensor: Original-Gewichtsmatrix (torch.Tensor).
+        r_true_tensor: Wahres Residuum.
+        r_quant_tensor: Quantisiertes Residuum.
+        log_scale_threshold: Linearer Bereich um 0 für SymLogNorm.
+        w_svd_tensor: Optional bereits berechnete W_svd-Matrix.
+        rank: Optionaler Rang für die SVD-Approximation (nur genutzt, wenn w_svd_tensor None ist).
     """
     # --- Imports sind hier gekapselt ---
     import os
@@ -488,139 +533,304 @@ def create_and_save_layer_heatmaps(
     from matplotlib.colors import SymLogNorm
 
     plt.switch_backend('Agg')
+    os.makedirs(output_path, exist_ok=True)
+
+    # --- Optional: W_svd berechnen, falls nicht übergeben ---
+    W_svd_np = None
+    if w_svd_tensor is None and rank is not None and rank > 0:
+        with torch.no_grad():
+            W_cpu = w_original_tensor.cpu()
+            # Volle SVD (ökonomisch), dann Top-r Rekonstruktion
+            U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
+            r = min(int(rank), S.shape[0])
+            U_r = U[:, :r]
+            Vh_r = Vh[:r, :]
+            S_r = S[:r].unsqueeze(1)  # (r,1)
+            w_svd_tensor = U_r @ (S_r * Vh_r)
+
+    if w_svd_tensor is not None:
+        W_svd_np = w_svd_tensor.detach().cpu().numpy()
 
     # --- Daten für Matplotlib vorbereiten ---
-    original_matrix = w_original_tensor.cpu().numpy()
-    true_residual_matrix = r_true_tensor.cpu().numpy()
-    quant_residual_matrix = r_quant_tensor.cpu().numpy()
+    original_matrix = w_original_tensor.detach().cpu().numpy()
+    true_residual_matrix = r_true_tensor.detach().cpu().numpy()
+    quant_residual_matrix = r_quant_tensor.detach().cpu().numpy()
+    reconstructed_matrix_np = None
+    if W_svd_np is not None:
+        reconstructed_matrix_np = quant_residual_matrix + W_svd_np
 
-    # --- Gemeinsame Skala ermitteln (bleibt wichtig für den Normierungsanker) ---
-    vmax = np.max([np.abs(original_matrix).max(), np.abs(true_residual_matrix).max(), np.abs(quant_residual_matrix).max()])
+    # --- Gemeinsame Skala ermitteln (inkl. aller Matrizen) ---
+    candidates = [
+        np.abs(original_matrix).max(),
+        np.abs(true_residual_matrix).max(),
+        np.abs(quant_residual_matrix).max()
+    ]
+    if W_svd_np is not None:
+        candidates.append(np.abs(W_svd_np).max())
+    if reconstructed_matrix_np is not None:
+        candidates.append(np.abs(reconstructed_matrix_np).max())
+
+    vmax = float(np.max(candidates)) if candidates else 1.0
     vmin = -vmax
 
-    # --- NEU: SymLogNorm definieren ---
-    # Diese Norm wendet eine logarithmische Skalierung auf Werte an, die außerhalb 
-    # des Schwellenwerts [-linthresh, linthresh] liegen. Das macht feine Strukturen sichtbar.
+    # SymLogNorm für bessere Struktur-Sichtbarkeit
     log_norm = SymLogNorm(linthresh=log_scale_threshold, vmin=vmin, vmax=vmax, base=10)
 
-    # --- Plot erstellen ---
-    fig, axes = plt.subplots(1, 3, figsize=(24, 7))
-    fig.suptitle(f"Analyse der Gewichte & Residuen für Layer: {layer_name} (Log-Skala)", fontsize=16)
+    # --- Plot erstellen: 2x3 Layout (5 Charts + 1 leer) ---
+    fig, axes = plt.subplots(2, 3, figsize=(24, 10))
+    fig.suptitle(f"Analyse der Gewichte & Residuen für Layer: {layer_name} (SymLog-Skala)", fontsize=18)
     cmap = 'coolwarm'
 
-    # Plot 1: Originalgewichte
-    im = axes[0].imshow(original_matrix, cmap=cmap, norm=log_norm)
-    axes[0].set_title("1. Originalgewichte (W_original)")
-    axes[0].grid(False)
+    # 1) W_original
+    im0 = axes[0, 0].imshow(original_matrix, cmap=cmap, norm=log_norm)
+    axes[0, 0].set_title("1. Originalgewichte (W_original)")
+    axes[0, 0].grid(False)
 
-    # Plot 2: Wahres Residuum
-    axes[1].imshow(true_residual_matrix, cmap=cmap, norm=log_norm)
-    axes[1].set_title("2. Wahres Residual W_res")
-    axes[1].grid(False)
+    # 2) W_svd (falls vorhanden)
+    if W_svd_np is not None:
+        axes[0, 1].imshow(W_svd_np, cmap=cmap, norm=log_norm)
+        suffix = f" (Top-{rank} Approx.)" if rank is not None else ""
+        axes[0, 1].set_title(f"2. SVD-Approximation W_svd{suffix}")
+    else:
+        axes[0, 1].imshow(np.zeros_like(original_matrix), cmap=cmap, norm=log_norm)
+        axes[0, 1].set_title("2. SVD-Approximation W_svd (nicht verfügbar)")
+    axes[0, 1].grid(False)
 
-    # Plot 3: Quantisiertes Residuum
-    axes[2].imshow(quant_residual_matrix, cmap=cmap, norm=log_norm)
-    axes[2].set_title("3. Quantisiertes Residual Q(W_res)")
-    axes[2].grid(False)
+    # 3) Wahres Residuum
+    axes[1, 0].imshow(true_residual_matrix, cmap=cmap, norm=log_norm)
+    axes[1, 0].set_title("3. Wahres Residuum (W_res)")
+    axes[1, 0].grid(False)
 
-    # Gemeinsame Farbleiste (wird jetzt nicht-linear sein)
-    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.8, label="Gewichtswert")
+    # 4) Quantisiertes Residuum
+    axes[1, 1].imshow(quant_residual_matrix, cmap=cmap, norm=log_norm)
+    axes[1, 1].set_title("4. Quantisiertes Residuum Q(W_res)")
+    axes[1, 1].grid(False)
     
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    # 5) Rekonstruktion Q(W_res) + W_svd
+    if reconstructed_matrix_np is not None:
+        axes[0, 2].imshow(reconstructed_matrix_np, cmap=cmap, norm=log_norm)
+        axes[0, 2].set_title("5. Rekonstruktion (Q(W_res) + W_svd)")
+    else:
+        axes[0, 2].set_title("5. Rekonstruktion (nicht verfügbar)")
+        axes[0, 2].axis('off')  # Ausblenden, wenn nicht berechenbar
+    axes[0, 2].grid(False)
+    
+    # Leeren 6. Plot ausblenden
+    axes[1, 2].axis('off')
+
+    # Gemeinsame Farbleiste
+    cbar = fig.colorbar(im0, ax=axes.ravel().tolist(), shrink=0.8, label="Gewichtswert")
+
+    plt.tight_layout(rect=[0, 0.03, 0.98, 0.95])
 
     # --- Datei speichern ---
-    safe_filename = layer_name.replace('.', '_') + "_log_scale.png"
+    safe_filename = layer_name.replace('.', '_') + "_full_analysis.png"
     full_save_path = os.path.join(output_path, safe_filename)
     plt.savefig(full_save_path, dpi=150)
     plt.close(fig)
 
+def visualize_svd_coverage(
+    layer_name: str,
+    output_path: str,
+    w_original_tensor: torch.Tensor,
+    ranks: list[int]
+):
+    """
+    Visualisiert die SVD-Energieabdeckung (kumulative Energie) für mehrere Ranks.
+    Speichert eine PNG-Grafik und eine CSV-Tabelle mit den %-Werten.
+
+    Args:
+        layer_name: Layername (für Titel/Dateiname)
+        output_path: Zielordner
+        w_original_tensor: Gewichts-Tensor (torch.Tensor)
+        ranks: Liste von Ranks (z.B. [1,2,4,8,16,32,64,128,256,512])
+    """
+    # --- Imports lokal halten ---
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    plt.switch_backend('Agg')
+    os.makedirs(output_path, exist_ok=True)
+
+    # Nur die Singulärwerte berechnen (billiger als volle SVD)
+    W_cpu = w_original_tensor.cpu()
+    s = torch.linalg.svdvals(W_cpu)  # 1D: absteigend sortiert
+    s_np = s.numpy()
+
+    s_squared = s_np ** 2
+    total_energy = float(np.sum(s_squared))
+    if total_energy <= 0.0:
+        total_energy = 1e-12
+    cum_energy = np.cumsum(s_squared) / total_energy  # [0..1]
+
+    # Valide Ränge beschränken
+    max_rank = s_np.shape[0]
+    ranks = [int(r) for r in ranks if 1 <= int(r) <= max_rank]
+    if not ranks:
+        return
+
+    # Prozentwerte je Rank sammeln
+    coverage_pct = []
+    for r in ranks:
+        coverage_pct.append(float(cum_energy[r - 1] * 100.0))
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(np.arange(1, max_rank + 1), cum_energy * 100.0, color='gray', alpha=0.5, label='Cumulative energy')
+    ax.scatter(ranks, coverage_pct, color='tab:blue', label='Requested ranks')
+    for r, p in zip(ranks, coverage_pct):
+        ax.annotate(f"{p:.1f}%", (r, p), textcoords="offset points", xytext=(4, 4), fontsize=8)
+
+    ax.set_title(f"SVD Coverage vs. Rank: {layer_name}")
+    ax.set_xlabel("Rank")
+    ax.set_ylabel("Coverage (%)")
+    ax.set_xscale("log")  # log hilft die Liste RANKS=(1,2,4,8,...) zu visualisieren
+    ax.set_ylim(0, 100)
+    ax.grid(True, which="both", ls="--", alpha=0.4)
+    ax.legend()
+
+    safe_prefix = layer_name.replace('.', '_')
+    png_path = os.path.join(output_path, f"{safe_prefix}_svd_coverage.png")
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=120)
+    plt.close(fig)
+
+    # CSV schreiben
+    import csv
+    csv_path = os.path.join(output_path, f"{safe_prefix}_svd_coverage.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["rank", "coverage_percent"])
+        for r, p in zip(ranks, coverage_pct):
+            w.writerow([r, f"{p:.6f}"])
     
+    # Konsolen-Log
+    print(f"SVD coverage for {layer_name}: " + ", ".join([f"r={r}:{p:.2f}%" for r, p in zip(ranks, coverage_pct)]))
+
 def visualize_svd_components(
     layer_name: str,
     output_path: str,
     w_original_tensor: torch.Tensor,
-    rank: int
+    rank: Optional[int] = None,
+    coverage_ranks: list[int] = None
 ):
     """
-    Führt eine SVD auf der Original-Gewichtsmatrix durch und visualisiert die
-    Komponenten S, U und Vh. Hebt die relativen Anteile der Singulärwerte hervor.
-    
-    Args:
-        layer_name: Name des Layers für Titel und Dateinamen.
-        output_path: Ordner zum Speichern des Bildes.
-        w_original_tensor: PyTorch-Tensor der Originalgewichte.
-        rank: Der LoRA-Rang, der für die Hervorhebung verwendet wird.
+    Visualisiert SVD als 4-Chart-Layout:
+      Zeile 1: Singularwerte (log) über beide Spalten, farbige Marker für alle coverage_ranks.
+      Zeile 2: Singularwerte (linear) über beide Spalten, farbige Marker für alle coverage_ranks.
+      Zeile 3: Heatmaps U_r (links) und Vh_r (rechts), nur wenn rank gesetzt ist.
+    In der Legende steht für jeden Rank der Coverage-%-Wert.
     """
-    # --- Imports sind hier gekapselt ---
     import os
-    import torch
     import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
 
     plt.switch_backend('Agg')
+    os.makedirs(output_path, exist_ok=True)
 
-    # --- Schritt 1: Volle SVD auf der CPU durchführen für die Analyse ---
-    # Wir führen die SVD auf der CPU durch, um GPU-Speicher zu schonen.
+    if coverage_ranks is None:
+        coverage_ranks = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+    # SVD (CPU)
     W_cpu = w_original_tensor.cpu()
     U, S, Vh = torch.linalg.svd(W_cpu, full_matrices=False)
-    
     s_np = S.numpy()
+    n_sv = s_np.shape[0]
+    idx = np.arange(n_sv)
 
-    # --- Schritt 2: "Energie" und prozentualen Anteil berechnen ---
-    # Die "Energie" ist proportional zum Quadrat der Singulärwerte.
-    s_squared = s_np ** 2
-    total_energy = np.sum(s_squared)
-    kept_energy = np.sum(s_squared[:rank])
-    percentage_kept = (kept_energy / total_energy) * 100 if total_energy > 0 else 0
+    # Coverage
+    s2 = s_np ** 2
+    tot = float(np.sum(s2)) or 1e-12
+    cum = np.cumsum(s2) / tot
 
-    # --- Schritt 3: Matrizen U und Vh für Heatmaps vorbereiten (gekürzt) ---
-    U_r = U[:, :rank].numpy()
-    Vh_r = Vh[:rank, :].numpy()
+    cov_ranks = [int(r) for r in coverage_ranks if 1 <= int(r) <= n_sv]
+    cov_pcts = [float(cum[r - 1] * 100.0) for r in cov_ranks]
 
-    # --- Schritt 4: Figur mit einem komplexen Grid-Layout für die Plots erstellen ---
-    fig = plt.figure(figsize=(18, 13))
-    gs = gridspec.GridSpec(2, 2, figure=fig, height_ratios=[1, 1])
-    
-    ax_s = fig.add_subplot(gs[0, :])  # Oberer Plot erstreckt sich über die ganze Breite
-    ax_u = fig.add_subplot(gs[1, 0])  # Unterer linker Plot
-    ax_vh = fig.add_subplot(gs[1, 1]) # Unterer rechter Plot
+    # Farben
+    cmap = plt.get_cmap('tab20')
+    colors = [cmap(i % 20) for i in range(len(cov_ranks))]
 
-    fig.suptitle(f"SVD-Analyse für Layer: {layer_name}", fontsize=18, y=0.97)
+    def plot_singular(ax, yscale: Optional[str], title: str):
+        # Grundbalken
+        ax.bar(idx, s_np, color='lightgray', label=f'Alle SVs (n={n_sv})')
+        # Optional: Top-r hervorheben
+        if rank is not None and rank >= 1:
+            ax.bar(idx[:rank], s_np[:rank], color='cornflowerblue', alpha=0.7,
+                   label=f'Behaltene SVs (≤ {rank})')
+        # RANKS farbig markieren
+        for (r, p, c) in zip(cov_ranks, cov_pcts, colors):
+            ax.axvline(x=r - 0.5, color=c, linestyle='--', linewidth=1.8)
+            ax.plot(r - 1, s_np[r - 1], marker='o', color=c, markersize=5,
+                    label=f"r={r}: {p:.1f}%")
+        ax.set_title(title, fontsize=14)
+        ax.set_xlabel("Index des Singulärwerts")
+        ax.set_ylabel("Singulärwerte" + (" (log)" if yscale == "log" else ""))
+        if yscale:
+            ax.set_yscale(yscale)
+        ax.grid(True, which="both", ls="--", alpha=0.4)
+        ax.legend(ncol=4, fontsize=8)
 
-    # --- Plot 1: Singulärwerte (S) mit Hervorhebung ---
-    indices = np.arange(len(s_np))
-    ax_s.bar(indices, s_np, color='lightgray', label=f'Verworfene SVs (Rang > {rank})')
-    ax_s.bar(indices[:rank], s_np[:rank], color='cornflowerblue', label=f'Behaltene SVs (Rang <= {rank})')
-    
-    title_text = (f"Singulärwerte (S)\n"
-                  f"Die Top-{rank} SVs erfassen {percentage_kept:.2f}% der quadratischen Norm ('Energie')")
-    ax_s.set_title(title_text, fontsize=14)
-    ax_s.set_ylabel("Wert (log-skaliert)")
-    ax_s.set_xlabel("Index des Singulärwerts")
-    ax_s.set_yscale('log')
-    ax_s.legend()
-    ax_s.grid(True, which="both", ls="--", alpha=0.5)
+    # Layout: 3 Zeilen, 2 Spalten
+    # Row 0: SVD (log) span beide Spalten
+    # Row 1: SVD (linear) span beide Spalten
+    # Row 2: Heatmaps U_r (links) & Vh_r (rechts) (nur wenn rank gesetzt)
+    fig = plt.figure(figsize=(20, 18))
+    gs = gridspec.GridSpec(
+        3, 2, figure=fig,
+        height_ratios=[1.2, 1.2, 1.0]
+    )
 
-    # --- Plot 2: Linke Singulärvektoren (U_r) ---
-    ax_u.imshow(U_r, cmap='viridis', aspect='auto')
-    ax_u.set_title(f"Linke Vektoren (U_r), Shape: {U_r.shape}")
-    ax_u.set_xlabel("Rang-Dimension")
-    ax_u.set_ylabel("Original-Dimension")
+    # Zeile 0: SVD log
+    ax_log = fig.add_subplot(gs[0, :])
+    plot_singular(ax_log, "log", f"SVD-Analyse (log) – {layer_name}")
 
-    # --- Plot 3: Rechte Singulärvektoren (Vh_r) ---
-    ax_vh.imshow(Vh_r, cmap='viridis', aspect='auto')
-    ax_vh.set_title(f"Rechte Vektoren (Vh_r), Shape: {Vh_r.shape}")
-    ax_vh.set_xlabel("Original-Dimension")
-    ax_vh.set_ylabel("Rang-Dimension")
-    
+    # Zeile 1: SVD linear
+    ax_lin = fig.add_subplot(gs[1, :])
+    plot_singular(ax_lin, None, "SVD-Analyse (linear)")
+
+    # Zeile 2: Heatmaps, nur wenn rank vorhanden
+    if rank is not None and rank >= 1:
+        use_r = min(rank, n_sv)
+        U_r = U[:, :use_r].numpy()
+        Vh_r = Vh[:use_r, :].numpy()
+
+        ax_u = fig.add_subplot(gs[2, 0])
+        im_u = ax_u.imshow(U_r, cmap='viridis', aspect='auto')
+        ax_u.set_title(f"Linke Vektoren (U_r), Shape: {U_r.shape}")
+        ax_u.set_xlabel("Rang-Dimension")
+        ax_u.set_ylabel("Original-Dimension")
+        fig.colorbar(im_u, ax=ax_u, fraction=0.046, pad=0.02)
+
+        ax_vh = fig.add_subplot(gs[2, 1])
+        im_v = ax_vh.imshow(Vh_r, cmap='viridis', aspect='auto')
+        ax_vh.set_title(f"Rechte Vektoren (Vh_r), Shape: {Vh_r.shape}")
+        ax_vh.set_xlabel("Original-Dimension")
+        ax_vh.set_ylabel("Rang-Dimension")
+        fig.colorbar(im_v, ax=ax_vh, fraction=0.046, pad=0.02)
+
+        kept_pct = float(np.sum(s2[:use_r]) / tot * 100.0)
+        supt = (f"SVD-Komponenten & Coverage – {layer_name}\n"
+                f"Top-{use_r} SVs erfassen {kept_pct:.2f}% der Energie – "
+                f"alle RANKS markiert")
+    else:
+        supt = (f"SVD & Coverage – {layer_name} (ohne spezifischen Rank)\n"
+                f"Max Rank Marker: r={max(cov_ranks) if cov_ranks else '-'} → "
+                f"{(cov_pcts[cov_ranks.index(max(cov_ranks))] if cov_ranks else 0.0):.2f}%")
+
+    fig.suptitle(supt, fontsize=16, y=0.98)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-    # --- Schritt 5: Figur speichern ---
-    safe_filename = layer_name.replace('.', '_') + "_svd_analysis.png"
-    full_save_path = os.path.join(output_path, safe_filename)
-    plt.savefig(full_save_path, dpi=120) # DPI leicht reduziert für schnellere Speicherung
+    # Speichern
+    out = os.path.join(
+        output_path,
+        layer_name.replace('.', '_') + "_svd_4charts_with_coverage.png"
+    )
+    plt.savefig(out, dpi=150)
     plt.close(fig)
+
+
     
 def main():
     parser = argparse.ArgumentParser(description="Evaluate pre-quantized residual connection models")
