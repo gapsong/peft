@@ -19,19 +19,25 @@ from peft import PeftModel
 datasets.config.HF_DATASETS_TRUST_REMOTE_CODE = True
 
 
-def load_model_and_tokenizer(model_name_or_path, base_model=None):
+def load_model_and_tokenizer(adapter_path=None, residual_model=None):
     """Load model and tokenizer from path"""
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    tokenizer = AutoTokenizer.from_pretrained(residual_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    if adapter_path is None and residual_model is not None:
+        model = AutoModelForCausalLM.from_pretrained(
+            residual_model, device_map="auto", torch_dtype=torch.float16
+        )
+        model.eval()
+        return model, tokenizer
     # Check if this is a PEFT model
-    adapter_config_path = os.path.join(model_name_or_path, "adapter_config.json")
+    adapter_config_path = os.path.join(adapter_path, "adapter_config.json")
 
     if os.path.exists(adapter_config_path):
-        print(f"Loading PEFT model from {model_name_or_path}")
+        print(f"Loading PEFT model from {adapter_path}")
 
         # Read adapter config
         with open(adapter_config_path, "r") as f:
@@ -40,35 +46,21 @@ def load_model_and_tokenizer(model_name_or_path, base_model=None):
         # Get base model name
         # hier muss das basemodel mit dem residual model austausgetauscht werden
         base_model_name = adapter_config.get("base_model_name_or_path")
-        if base_model:
-            base_model_name = base_model
 
         if not base_model_name:
             raise ValueError("Base model not specified and not found in adapter config")
 
         print(f"Base model: {base_model_name}")
-        # base_model_name = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals/temp_residual_base"
-        # quantized version here
-        # base_model_name = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals/w_res_HuggingFaceTB_SmolLM2-1.7B_r256_daniel_4bit_gs32"
-        
-        # base_model_name = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals/w_res_HuggingFaceTB_SmolLM2-1.7B_r256_daniel_4bit_gs128"
-        
-        # base_model_name = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals/w_res_HuggingFaceTB_SmolLM2-1.7B_r256_daniel_3bit_gs32"
         # Load base model
-        base_model_obj = AutoModelForCausalLM.from_pretrained(
-            base_model_name, device_map="auto", torch_dtype=torch.float16
+        residual_model_obj = AutoModelForCausalLM.from_pretrained(
+            residual_model, device_map="auto", torch_dtype=torch.float16
         )
-        # model_name_or_path = "/home/nudel/Documents/peft/train_results_debugger/quantized_residuals/daniel_adapter_r256_HuggingFaceTB_SmolLM2-1.7B"
+
         # Load PEFT model
-        model = PeftModel.from_pretrained(base_model_obj, model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto")
-        # model = base_model_obj
+        model = PeftModel.from_pretrained(residual_model_obj, adapter_path, torch_dtype=torch.bfloat16, device_map="auto")
         model.eval()
-
+        
         print(f"✅ PEFT model loaded successfully")
-
-    else:
-        print(f"Loading regular model from {model_name_or_path}")
-        model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto")
 
     return model, tokenizer
 
@@ -105,7 +97,7 @@ def test_model_generation(model, tokenizer, test_prompts=None):
         print(f"Response: '{clean_response}'")
 
 
-def evaluate_with_lm_eval(model, tokenizer, tasks, num_fewshot=5, limit=None, per_device_eval_batch_size=1):
+def evaluate_with_lm_eval(model, unmodified_base_model, tokenizer, tasks, num_fewshot=5, limit=None, per_device_eval_batch_size=1):
     """Evaluate model using lm-eval-harness"""
 
     # Create lm-harness model

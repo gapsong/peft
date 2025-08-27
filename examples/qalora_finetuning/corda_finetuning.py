@@ -382,6 +382,40 @@ def compare_models(model1, model2, model1_name="Model 1", model2_name="Model 2",
             print(f"  ... und {len(mismatched_params) - 10} weitere.")
         return False
 
+def check_cached_quantize(model_path, model_to_quantize, tokenizer, bits, group_size):
+    if os.path.exists(model_path) and os.path.exists(os.path.join(model_path, "config.json")):
+        print("quantization not needed, model is in cache already")
+        return
+
+    # Configure GPTQ with current settings
+    gptq_config = GPTQConfig(
+        bits=bits,
+        dataset="c4",
+        tokenizer=tokenizer,
+        group_size=group_size,
+        desc_act=False,
+        sym=False,
+        static_groups=False,
+        true_sequential=True,
+        actorder=True,
+    )
+
+    print(f"Loading residual model for {bits}-bit quantization...")
+    quantized_model = AutoModelForCausalLM.from_pretrained(
+        model_to_quantize, device_map="auto", quantization_config=gptq_config, torch_dtype=torch.float16
+    )
+
+    print(f"Saving {bits}-bit quantized W_res to: {model_path}")
+    quantized_model.save_pretrained(model_path)
+    tokenizer.save_pretrained(model_path)
+
+    # Clean up memory
+    del quantized_model
+    torch.cuda.empty_cache()
+
+    print(f"✅ {bits}-bit quantization complete!")
+    
+
 def train():
     parser = transformers.HfArgumentParser(TrainingArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
@@ -541,12 +575,12 @@ def train():
         adapter_name = f"daniel_adapter_r{script_args.lora_r}_{model_name_clean}"
         adapter_path = os.path.join(base_output_dir, adapter_name)
         
-        temp_residual_path = os.path.join(script_args.output_dir, f"{model_name_clean}_residual_base_r{script_args.lora_r}_fp16")
+        full_precision_residual_path = os.path.join(script_args.output_dir, f"{model_name_clean}_residual_base_r{script_args.lora_r}_fp16")
 
         # Prüfe, ob sowohl der Adapter als auch das Residual-Modell bereits existieren
-        if os.path.exists(adapter_path) and os.path.exists(temp_residual_path):
+        if os.path.exists(adapter_path) and os.path.exists(full_precision_residual_path):
             print(f"⏭️  Found cached adapter at: {adapter_path}")
-            print(f"⏭️  Found cached residual model at: {temp_residual_path}")
+            print(f"⏭️  Found cached residual model at: {full_precision_residual_path}")
             print("    Skipping model initialization and residual extraction.")
             
             # Lade die target_modules aus der Adapter-Konfiguration für die spätere Verwendung
@@ -566,21 +600,20 @@ def train():
             model = AutoModelForCausalLM.from_pretrained(
                 script_args.model_name_or_path,
                 low_cpu_mem_usage=True,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.float32,
                 device_map="cpu",
             )
             
             # Entdecke automatisch alle relevanten Layer-Namen
             target_modules = find_all_linear_names(model)
             
-            # Gib das CPU-Modell frei, wir laden es gleich richtig
             del model
             torch.cuda.empty_cache()
 
             model = AutoModelForCausalLM.from_pretrained(
                 script_args.model_name_or_path,
                 device_map="auto",
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.float32,
             )
 
             lora_config = LoraConfig(
@@ -601,7 +634,7 @@ def train():
             peft_model.save_pretrained(adapter_path)
 
             print("🚀 Extracting residual weights using State Dict method...")
-            peft_base_model = peft_model.get_base_model().to(torch.bfloat16)
+            peft_base_model = peft_model.get_base_model().to(torch.float32)
             base_state_dict = peft_base_model.state_dict()
             clean_state_dict = {}
             
@@ -620,28 +653,26 @@ def train():
             print(f"📋 Extracted: {len(clean_state_dict)} clean weights")
             
             residual_model = AutoModelForCausalLM.from_pretrained(
-                script_args.model_name_or_path, torch_dtype=torch.bfloat16
+                script_args.model_name_or_path, torch_dtype=torch.float32
             )
             
             residual_model.load_state_dict(clean_state_dict, strict=False)
             
-            print(f"💾 Saving clean residual model to: {temp_residual_path}")
-            residual_model.save_pretrained(temp_residual_path)
-            tokenizer.save_pretrained(temp_residual_path)
+            print(f"💾 Saving clean residual model to: {full_precision_residual_path}")
+            residual_model.save_pretrained(full_precision_residual_path)
+            tokenizer.save_pretrained(full_precision_residual_path)
             print("✅ Clean residual model saved.")
             
             # Verifiziere den Speicher-/Ladevorgang
-            reloaded_model_loaded = AutoModelForCausalLM.from_pretrained(temp_residual_path, torch_dtype=torch.bfloat16)
+            reloaded_model_loaded = AutoModelForCausalLM.from_pretrained(full_precision_residual_path, torch_dtype=torch.float32)
             compare_models(
                 residual_model, reloaded_model_loaded, 
                 model1_name="Extracted Residual Model", 
                 model2_name="Reloaded Model"
             )
-       
+
         print("\n🧹 Aggressive Speicherbereinigung vor der Quantisierung...")
         
-        # Überprüfe, ob die Variablen existieren, bevor sie gelöscht werden
-        # (falls wir aus dem Cache-Pfad kommen, existieren sie nicht)
         if 'peft_model' in locals():
             del peft_model
         if 'model' in locals():
@@ -662,19 +693,14 @@ def train():
             torch.cuda.empty_cache()
         
         print("✅ Speicherbereinigung abgeschlossen. Starte Quantisierung...")
-       
-        
+
         # --- CACHING LOGIC END ---
 
         # Phase 4: Quantize W_res with different bit configurations
         quantization_configs = [
             {"bits": 2, "group_size": 32},
-            # {"bits": 2, "group_size": 64},  # Different group size for comparison
-            # {"bits": 2, "group_size": 128},
             {"bits": 3, "group_size": 32},
             {"bits": 4, "group_size": 32},
-            # {"bits": 4, "group_size": 64},  # Different group size for comparison
-            # {"bits": 4, "group_size": 128},
         ]
         quantized_models_info = []
 
@@ -690,132 +716,9 @@ def train():
             quantized_name = f"w_res_{model_name_clean}_r{script_args.lora_r}_daniel_{bits}bit_gs{group_size}"
             quantized_path = os.path.join(base_output_dir, quantized_name)
 
-            # Skip if already exists
-            if os.path.exists(quantized_path) and os.path.exists(os.path.join(quantized_path, "config.json")):
-                print(f"⏭️  Quantized model already exists: {quantized_path}")
-                quantized_models_info.append(
-                    {
-                        "bits": bits,
-                        "group_size": group_size,
-                        "quantized_path": quantized_path,
-                        "adapter_path": adapter_path,
-                        "status": "exists",
-                    }
-                )
-                continue
-
-            try:
-                # Configure GPTQ with current settings
-                gptq_config = GPTQConfig(
-                    bits=bits,
-                    dataset="c4",
-                    tokenizer=tokenizer,
-                    group_size=group_size,
-                    desc_act=False,
-                    sym=False,
-                    static_groups=False,
-                    true_sequential=True,
-                    actorder=True,
-                )
-
-                print(f"Loading residual model for {bits}-bit quantization...")
-                quantized_model = AutoModelForCausalLM.from_pretrained(
-                    temp_residual_path, device_map="auto", quantization_config=gptq_config, torch_dtype=torch.float16
-                )
-
-                print(f"Saving {bits}-bit quantized W_res to: {quantized_path}")
-                quantized_model.save_pretrained(quantized_path)
-                tokenizer.save_pretrained(quantized_path)
-
-                if isinstance(target_modules, set):
-                    print("🔧 Konvertiere 'target_modules' von 'set' zu 'list' für die JSON-Speicherung.")
-                    serializable_target_modules = list(target_modules)
-                else:
-                    serializable_target_modules = target_modules
-                # --- ENDE DES FIXES ---
-
-                # Save metadata about this quantization
-                metadata = {
-                    "base_model": temp_residual_path,
-                    "lora_rank": script_args.lora_r,
-                    "lora_alpha": 2 * script_args.lora_r,
-                    "initialization": False,
-                    "quantization": {
-                        "bits": bits,
-                        "group_size": group_size,
-                        "desc_act": False,
-                        "sym": False,
-                        "static_groups": False,
-                        "true_sequential": True,
-                        "actorder": True,
-                    },
-                    "target_modules": serializable_target_modules,  # Verwende die bereinigte Liste
-                    "adapter_path": adapter_path,
-                }
-
-                with open(os.path.join(quantized_path, "quantization_metadata.json"), "w") as f:
-                    import json
-
-                    json.dump(metadata, f, indent=2)
-
-                quantized_models_info.append(
-                    {
-                        "bits": bits,
-                        "group_size": group_size,
-                        "quantized_path": quantized_path,
-                        "adapter_path": adapter_path,
-                        "status": "created",
-                    }
-                )
-
-                # Clean up memory
-                del quantized_model
-                torch.cuda.empty_cache()
-
-                print(f"✅ {bits}-bit quantization complete!")
-
-            except Exception as e:
-                print(f"❌ Failed to quantize with {bits}-bit, group_size={group_size}: {e}")
-                quantized_models_info.append(
-                    {
-                        "bits": bits,
-                        "group_size": group_size,
-                        "quantized_path": None,
-                        "adapter_path": adapter_path,
-                        "status": "failed",
-                        "error": str(e),
-                    }
-                )
-                continue
-
-        # Phase 5: Save summary of all quantized models
-        summary = {
-            "base_model": script_args.model_name_or_path,
-            "lora_config": {
-                "r": script_args.lora_r,
-                "alpha": 2 * script_args.lora_r,
-                "target_modules": target_modules,
-                "initialization": "daniel",
-            },
-            "adapter_path": adapter_path,
-            "quantized_models": quantized_models_info,
-            "total_created": len([x for x in quantized_models_info if x["status"] == "created"]),
-            "total_existing": len([x for x in quantized_models_info if x["status"] == "exists"]),
-            "total_failed": len([x for x in quantized_models_info if x["status"] == "failed"]),
-        }
-
-        summary_path = os.path.join(
-            base_output_dir, f"quantization_summary_r{script_args.lora_r}_{model_name_clean}.json"
-        )
-        with open(summary_path, "w") as f:
-            import json
-
-            json.dump(summary, f, indent=2)
-
-        # Cleanup temporary files
-        import shutil
-
-        # shutil.rmtree(temp_residual_path)
+            check_cached_quantize(quantized_path, full_precision_residual_path, tokenizer=tokenizer, bits=bits, group_size=group_size)
+            load_or_quantize_model(script_args.model_name_or_path, tokenizer=tokenizer, qalora_group_size=group_size, bits=bits)
+            
 
         print(f"\n{'=' * 60}")
         print("🎉 QUANTIZATION SUMMARY")
@@ -823,11 +726,6 @@ def train():
         print(f"Base model: {script_args.model_name_or_path}")
         print(f"LoRA rank: {script_args.lora_r}")
         print(f"Adapter saved to: {adapter_path}")
-        print(f"Created: {summary['total_created']} quantized models")
-        print(f"Existing: {summary['total_existing']} quantized models")
-        print(f"Failed: {summary['total_failed']} quantizations")
-        print(f"Summary saved to: {summary_path}")
-        print("\nQuantized models:")
         for info in quantized_models_info:
             status_emoji = {"created": "✅", "exists": "⏭️", "failed": "❌"}[info["status"]]
             print(f"  {status_emoji} {info['bits']}-bit (gs={info['group_size']}) -> {info['quantized_path']}")

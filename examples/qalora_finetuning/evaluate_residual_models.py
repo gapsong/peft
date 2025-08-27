@@ -27,7 +27,7 @@ def parse_residual_model_info(model_path: str) -> Dict[str, Any]:
     if match:
         base_model_part, rank, bits, group_size = match.groups()
         return {
-            "base_model_name": base_model_part.replace("_", "/"),
+            "base_model_name": base_model_part,
             "rank": int(rank),
             "bits": int(bits),
             "group_size": int(group_size),
@@ -84,6 +84,14 @@ def discover_residual_models(base_dir: str) -> List[Dict[str, Any]]:
                     print(f"🔍 Found model: {item} -> Type: {model_info['model_type']}, Rank: {model_info['rank']}, Bits: {model_info['bits']}")
     
     return sorted(models, key=lambda x: (x["rank"], x["bits"], x.get("group_size", 0)))
+
+
+def find_corresponding_quantized_model(base_model_name: str, bit: str, group_size: str ) -> str:
+    """Find the corresponding adapter for a quantized base model"""
+    quantized_model = f"/home/nudel/Documents/peft/quantized_models/{base_model_name}_gptq_{bit}bit_groupsize_{group_size}"
+    if os.path.exists(quantized_model):
+        return quantized_model
+    return None
 
 
 def find_corresponding_adapter(base_model_path: str, base_dir: str) -> str:
@@ -158,11 +166,12 @@ def evaluate_residual_model(
             # This is a quantized base model, find its adapter
             base_model_path = model_path
             adapter_path = find_corresponding_adapter(model_path, base_dir)
+            quantized_model_path = find_corresponding_quantized_model(base_model_name=model_info["base_model_name"], bit=model_info["bits"], group_size=model_info["group_size"] )
             
             if not adapter_path:
                 raise ValueError(f"Could not find corresponding adapter for {os.path.basename(model_path)}")
             
-            print(f"   Base model: {os.path.basename(base_model_path)}")
+            print(f"   Residualmodel: {os.path.basename(base_model_path)}")
             print(f"   Adapter: {os.path.basename(adapter_path)}")
         elif model_info["model_type"] == "residual_fp16_base":
             # This is an unquantized FP16 base model, find its adapter
@@ -186,10 +195,15 @@ def evaluate_residual_model(
             raise ValueError(f"Unknown model type: {model_info['model_type']}")
         
         # Load model
-        model, tokenizer = load_model_and_tokenizer(adapter_path, base_model_path)
+        quantised_residual_with_LR_model, tokenizer = load_model_and_tokenizer(adapter_path, base_model_path)
+        quantized_model, _ = load_model_and_tokenizer(None, quantized_model_path)
         
         prefix = "/home/nudel/Documents/peft/visualizations"
-        errors = calculate_reconstruction_errors(adapter_path, model, visualization_path=f"{prefix}/layer_heatmaps_rank_16", svd_visualization_path=f"{prefix}/svd_heatmaps_rank_16")
+        errors = calculate_reconstruction_errors(adapter_path, quantised_residual_with_LR_model, quantized_model=quantized_model, visualization_path=f"{prefix}/layer_heatmaps_rank_16", svd_visualization_path=f"{prefix}/svd_heatmaps_rank_16")
+        
+        del quantized_model
+        torch.cuda.empty_cache()
+
         svd_error = errors.get('svd_error', 0.0)
         quant_error = errors.get('quant_error', 0.0)
         total_error = errors.get('total_error', 0.0)
@@ -204,31 +218,12 @@ def evaluate_residual_model(
         print(f"  🎯 Gesamtfehler:      {total_error:>8.4%}")
         print(f"     (Endgültige Abweichung des kombinierten Modells von W_original)")
         print("-------------------------------------------")
-       
+
         limit = 100
         # Run evaluation
-        # from transformers import GPTQConfig 
-        # gptq_config = GPTQConfig(
-        #     bits=2,
-        #     dataset="c4",
-        #     tokenizer=tokenizer,
-        #     group_size=32,
-        #     desc_act=False,
-        #     sym=False,
-        #     static_groups=False,
-        #     true_sequential=True,
-        #     actorder=True,
-        # )
-        
-        # quantize_model_directly = AutoModelForCausalLM.from_pretrained(
-        #     "TinyLlama/TinyLlama_v1.1",
-        #     low_cpu_mem_usage=True,
-        #     quantization_config=gptq_config,
-        #     torch_dtype=torch.float32
-        # )
-        
+
         results = evaluate_with_lm_eval(
-            model=model,
+            model=quantised_residual_with_LR_model,
             tokenizer=tokenizer,
             tasks=tasks,
             num_fewshot=num_fewshot,
@@ -237,9 +232,9 @@ def evaluate_residual_model(
         )
         
         # Clean up
-        del model
+        del quantised_residual_with_LR_model
         torch.cuda.empty_cache()
-       
+
         print_results(results)
 
         return {
@@ -350,7 +345,7 @@ def create_residual_performance_table(results: List[Dict], output_dir: str):
     
     print(f"📄 LaTeX saved to: {latex_file}")
     print(f"\n{'='*60}\n" + "\n".join(latex) + f"\n{'='*60}")
-  
+
 def _get_lora_target_modules(peft_model: PeftModel) -> Dict[str, torch.nn.Module]:
     """Helper to find all LoRA layers in a PeftModel."""
     lora_layers = {}
@@ -363,6 +358,7 @@ def _get_lora_target_modules(peft_model: PeftModel) -> Dict[str, torch.nn.Module
 def calculate_reconstruction_errors(
     adapter_path: str,
     peft_model: PeftModel,
+    quantized_model: AutoModelForCausalLM = None,
     visualization_path: Optional[str] = None,
     svd_visualization_path: Optional[str] = None
 ) -> Dict[str, float]:
@@ -406,6 +402,7 @@ def calculate_reconstruction_errors(
         
     with torch.no_grad():
         original_modules = dict(true_original_model.named_modules())
+        quantized_modules = dict(quantized_model.named_modules())
         lora_layers = _get_lora_target_modules(peft_model)
 
         if not lora_layers:
@@ -429,9 +426,10 @@ def calculate_reconstruction_errors(
                 continue
             
             W_original = original_modules[original_layer_name].weight.data.clone().to(torch.float32)
+            W_quantized_model = quantized_modules[original_layer_name].dequantize_weight().data.clone().to(torch.float32)
+            W_quantized_model = W_quantized_model.T
             R_quant = peft_layer.get_base_layer().dequantize_weight().data.clone().to(torch.float32)
             R_quant = R_quant.T 
-
 
             adapter_name = peft_layer.active_adapters[0]
             lora_A = peft_layer.lora_A[adapter_name].weight.data.clone().to(torch.float32)
@@ -449,6 +447,7 @@ def calculate_reconstruction_errors(
                     layer_name=peft_layer_name,
                     output_path=visualization_path,
                     w_original_tensor=W_original,
+                    w_quantized_model=W_quantized_model,
                     r_true_tensor=R_true,
                     r_quant_tensor=R_quant,
                     rank=rank  # sorgt für automatische W_svd-Berechnung/Visualisierung
@@ -499,6 +498,7 @@ def create_and_save_layer_heatmaps(
     layer_name: str,
     output_path: str,
     w_original_tensor: torch.Tensor,
+    w_quantized_model: torch.Tensor,
     r_true_tensor: torch.Tensor,
     r_quant_tensor: torch.Tensor,
     log_scale_threshold: float = 1e-3,  # Schwellenwert für den linearen Bereich um Null
@@ -553,6 +553,7 @@ def create_and_save_layer_heatmaps(
 
     # --- Daten für Matplotlib vorbereiten ---
     original_matrix = w_original_tensor.detach().cpu().numpy()
+    quantized_matrix = w_quantized_model.detach().cpu().numpy()
     true_residual_matrix = r_true_tensor.detach().cpu().numpy()
     quant_residual_matrix = r_quant_tensor.detach().cpu().numpy()
     reconstructed_matrix_np = None
@@ -562,6 +563,7 @@ def create_and_save_layer_heatmaps(
     # --- Gemeinsame Skala ermitteln (inkl. aller Matrizen) ---
     candidates = [
         np.abs(original_matrix).max(),
+        np.abs(quantized_matrix).max(),
         np.abs(true_residual_matrix).max(),
         np.abs(quant_residual_matrix).max()
     ]
@@ -615,8 +617,16 @@ def create_and_save_layer_heatmaps(
         axes[0, 2].axis('off')  # Ausblenden, wenn nicht berechenbar
     axes[0, 2].grid(False)
     
+    if reconstructed_matrix_np is not None:
+        axes[1, 2].imshow(quantized_matrix, cmap=cmap, norm=log_norm)
+        axes[1, 2].set_title("6. Quantisierte Matrix. Der Konkurrent")
+    else:
+        axes[1, 2].set_title("6. (Rekonstruktion nicht verfügbar)")
+        axes[1, 2].axis('off')  # Ausblenden, wenn nicht berechenbar
+    axes[1, 2].grid(False)       
+    
     # Leeren 6. Plot ausblenden
-    axes[1, 2].axis('off')
+    # axes[1, 2].axis('off')
 
     # Gemeinsame Farbleiste
     cbar = fig.colorbar(im0, ax=axes.ravel().tolist(), shrink=0.8, label="Gewichtswert")
@@ -757,8 +767,7 @@ def visualize_svd_components(
         ax.bar(idx, s_np, color='lightgray', label=f'Alle SVs (n={n_sv})')
         # Optional: Top-r hervorheben
         if rank is not None and rank >= 1:
-            ax.bar(idx[:rank], s_np[:rank], color='cornflowerblue', alpha=0.7,
-                   label=f'Behaltene SVs (≤ {rank})')
+            ax.bar(idx[:rank], s_np[:rank], color='cornflowerblue', alpha=0.7, label=f'Behaltene SVs (≤ {rank})')
         # RANKS farbig markieren
         for (r, p, c) in zip(cov_ranks, cov_pcts, colors):
             ax.axvline(x=r - 0.5, color=c, linestyle='--', linewidth=1.8)
@@ -836,14 +845,10 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate pre-quantized residual connection models")
     
     # Input configuration
-    parser.add_argument("--residual_models_dir", type=str, 
-                       default="/home/nudel/Documents/peft/train_results_debugger/quantized_residuals",
-                       help="Directory containing quantized residual models")
+    parser.add_argument("--residual_models_dir", type=str, default="/home/nudel/Documents/peft/train_results_debugger/quantized_residuals", help="Directory containing quantized residual models")
     
     # Evaluation configuration
-    parser.add_argument("--tasks", type=str, 
-                       default="arc_challenge,arc_easy,boolq,hellaswag,openbookqa,piqa,winogrande",
-                       help="Evaluation tasks")
+    parser.add_argument("--tasks", type=str, default="arc_challenge,arc_easy,boolq,hellaswag,openbookqa,piqa,winogrande", help="Evaluation tasks")
     parser.add_argument("--num_fewshot", type=int, default=5, help="Number of few-shot examples")
     parser.add_argument("--limit", type=int, help="Limit number of samples for testing")
     parser.add_argument("--per_device_eval_batch_size", type=int, default=1, help="Evaluation batch size")
@@ -853,8 +858,7 @@ def main():
     parser.add_argument("--bits", type=str, help="Comma-separated bits to evaluate (e.g., '2,3,4')")
     
     # Output configuration  
-    parser.add_argument("--output_dir", type=str, default="./residual_eval_results", 
-                       help="Output directory for results")
+    parser.add_argument("--output_dir", type=str, default="./residual_eval_results", help="Output directory for results")
     parser.add_argument("--save_results", action="store_true", help="Save results to JSON")
     parser.add_argument("--generate_latex", action="store_true", help="Generate LaTeX table")
     
