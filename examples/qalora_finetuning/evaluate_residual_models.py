@@ -493,7 +493,7 @@ def calculate_reconstruction_errors(
             "quant_error": error_quant,
             "total_error": error_total,
         }
- 
+
 def create_and_save_layer_heatmaps(
     layer_name: str,
     output_path: str,
