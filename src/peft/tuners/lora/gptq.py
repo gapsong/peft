@@ -155,7 +155,8 @@ class GPTQLoraLinear(torch.nn.Module, LoraLayer):
             x = self._cast_input_dtype(x, lora_A.weight.dtype)
 
             if active_adapter not in self.lora_variant:  # vanilla LoRA
-                result = result + lora_B(lora_A(dropout(x))) * scaling
+                # result = result + lora_B(lora_A(dropout(x))) * scaling + self.outlier_layer[active_adapter](x)
+                result = result + lora_B(lora_A(dropout(x))) * scaling + self.outlier_layer[active_adapter](x)
             else:
                 result = self.lora_variant[active_adapter].forward(
                     self,

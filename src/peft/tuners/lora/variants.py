@@ -362,7 +362,7 @@ class QALoraLinearVariant(LoraVariant):
             device=device,
             dtype=dtype,
         )
-        # module.lora_A[adapter_name] = new_lora_A_layer
+        module.lora_A[adapter_name] = new_lora_A_layer
 
     @staticmethod
     def get_delta_weight(module: Linear, active_adapter: str) -> torch.Tensor:
@@ -386,6 +386,56 @@ class QALoraLinearVariant(LoraVariant):
             **kwargs: Additional keyword arguments for merging.
                 - amplification_factor (float): Factor to amplify scale. Default: 4.0.
         """
+        def _compute_weight_adjustment_forward_exact(module: nn.Module, active_adapter: str, effective_scale: float) -> torch.Tensor:
+            """
+            Computes the adjustment for the zero-point matrix based on the QALoRA paper (Eq. 7).
+            Adjustment = (s * L2 * L1) ⊘ A
+            s: effective_scale (alpha/r)
+            L2*L1: lora_B @ lora_A
+            A: scales
+            """
+            if not (
+                hasattr(module, "base_layer")
+                and hasattr(module.base_layer, "qzeros")
+                and hasattr(module.base_layer, "scales")
+            ):
+                return
+
+            lora_A_w = module.lora_A[active_adapter].weight    # [r, in_features//qalora_group_size]
+            lora_B_w = module.lora_B[active_adapter].weight    # [out_features, r]
+            scales = module.base_layer.scales                  # [num_gptq_groups, out_features]
+            
+            gptq_group_size = getattr(module.base_layer, "group_size", None)
+            qalora_group_size = module.qalora_group_size[active_adapter]
+            in_features = module.in_features
+
+            if gptq_group_size is None:
+                gptq_group_size = qalora_group_size
+
+            # Schritt 1: M = B @ A (im QALoRA Gruppenraum)
+            M_group_qalora = lora_B_w @ lora_A_w               # [out_features, in_features//qalora_group_size]
+
+            # Schritt 2: Ggf. auf GPTQ-Gruppengröße umrechnen
+            if qalora_group_size != gptq_group_size:
+                M_full = M_group_qalora.repeat_interleave(qalora_group_size, dim=1)
+                num_gptq_groups = in_features // gptq_group_size
+                M_group_gptq = M_full.view(M_full.shape[0], num_gptq_groups, gptq_group_size).mean(dim=2)
+            else:
+                M_group_gptq = M_group_qalora
+
+            # Schritt 3: Transponieren und Skalieren (s * L2 * L1)
+            # M_group_gptq ist [out_features, num_gptq_groups]. Transponieren zu [num_gptq_groups, out_features]
+            lora_delta_T = M_group_gptq.t() * effective_scale
+
+            # Schritt 4: Elementweise durch Scales teilen (⊘ A)
+            # Dies ist die finale Anpassung für den Zero-Point.
+            weight_adjustment = lora_delta_T / scales
+
+            if weight_adjustment.shape != scales.shape:
+                raise RuntimeError(f"Shape mismatch: adjustment {weight_adjustment.shape} vs scales {scales.shape}")
+            
+            return weight_adjustment
+        
         if not (
             hasattr(module, "base_layer")
             and hasattr(module.base_layer, "qzeros")
@@ -400,40 +450,11 @@ class QALoraLinearVariant(LoraVariant):
         lora_alpha = module.lora_alpha[active_adapter]
         scales = module.base_layer.scales
         qzeros_packed = module.base_layer.qzeros
-
-        # Holen Sie die Gruppengrößen aus den Modul-Attributen
-        qalora_group_size = module.qalora_group_size[active_adapter]
-        gptq_group_size = getattr(module.base_layer, "group_size", 32)
-
-        amplification_factor = kwargs.get("amplification_factor", 4.0)
         effective_scale = (lora_alpha / lora_r) 
         with torch.no_grad():
-            # --- 2. LoRA-Beitrag auf der gepoolten Ebene berechnen ---
-            # Dies ergibt eine "low-resolution" Delta-Matrix: delta_W_pooled
-            # Shape: [out_features, in_features / qalora_group_size]
-            delta_W_pooled = lora_B.weight @ lora_A.weight
-
-            # --- 3. "Un-Pooling": Den Beitrag auf die volle Dimension hochskalieren ---
-            # Wir wiederholen jede Spalte (die einem Pool entspricht) `qalora_group_size` mal,
-            # um die ursprüngliche `in_features`-Dimension wiederherzustellen.
-            # Shape: [out_features, in_features]
-            # delta_W_full = delta_W_pooled.repeat_interleave(qalora_group_size, dim=1)
-
-            # --- 4. Den "Full-Resolution-Shift" für die qzeros berechnen ---
-            # Zuerst transponieren wir, um die Form an die `scales` anzupassen.
-            # Shape: [in_features, out_features]
-            lora_contribution_full = delta_W_pooled
-
-            # Jetzt gruppieren wir diesen vollen Beitrag gemäß der GPTQ-Gruppengröße,
-            # indem wir den Mittelwert über jede Gruppe bilden.
-            # Shape: [in_features / gptq_group_size, out_features]
-            num_groups = scales.shape[0]
-            lora_contribution_grouped = lora_contribution_full.view(num_groups, gptq_group_size, -1).mean(dim=1)
-
-            # --- 5. LoRA-Adjustment im Gewichtsraum berechnen ---
-            # adjustment = grouped_lora_contribution * effective_scale
-            # Dies ist bereits im Gewichtsraum, nicht im quantisierten Raum
-            weight_adjustment = lora_contribution_grouped * effective_scale
+            weight_adjustment = _compute_weight_adjustment_forward_exact(module, active_adapter, effective_scale)  # [G, out]
+            if weight_adjustment.shape != scales.shape:
+                raise RuntimeError(f"weight_adjustment shape {weight_adjustment.shape} != scales {scales.shape}")
 
             # --- 6. Originale qzeros entpacken und vollständig dequantisieren ---
             bits = getattr(module.base_layer, "bits", 4)
@@ -488,36 +509,34 @@ class QALoraLinearVariant(LoraVariant):
                 dequantized_qzeros = unpacked_qzeros.to(torch.float32) * scales.to(torch.float32)
 
             # --- 7. LoRA-Shift auf dequantisierte qzeros anwenden ---
-            # Jetzt können wir den weight_adjustment direkt subtrahieren
-            new_qzeros_fp16 = (dequantized_qzeros - weight_adjustment.to(torch.float32)).to(torch.float16)
+            new_qzeros_fp16 = (dequantized_qzeros.to(torch.float32) - weight_adjustment.to(torch.float32)).to(torch.float16)
 
-            # --- 8. Alten qzeros-Parameter durch den neuen ersetzen ---
-            if hasattr(module.base_layer, "qzeros"):
-                delattr(module.base_layer, "qzeros")
-            module.base_layer.register_parameter("zeros", torch.nn.Parameter(new_qzeros_fp16, requires_grad=False))
+            module.base_layer.qzeros = torch.nn.Parameter(new_qzeros_fp16, requires_grad=False)
+            # orig_weight.register_parameter("zeros", torch.nn.Parameter(new_qzeros_fp16, requires_grad=False))
 
-            print(
-                f"Merged adapter into qzeros for layer. New zeros shape: {new_qzeros_fp16.shape}, dtype: {new_qzeros_fp16.dtype}, bits: {bits}"
-            )
 
     @staticmethod
     def unmerge(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("QALoRA for GPTQ layers does not support 'unmerge'.")
 
     @staticmethod
-    def forward(module: Linear, active_adapter: str, x: torch.Tensor, result: torch.Tensor) -> torch.Tensor:
-        # ================================================================= #
-        # TEIL 1: Bestehender QA-LoRA Code (bleibt 100% identisch)
-        # ================================================================= #
+    def forward(
+        module: Linear,
+        active_adapter: str,
+        x: torch.Tensor,
+        result: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
         lora_A_weight = module.lora_A[active_adapter].weight
         lora_B_weight = module.lora_B[active_adapter].weight
         dropout = module.lora_dropout[active_adapter]
-        lora_scaling_coefficient = module.scaling[active_adapter]
+        scaling = module.scaling[active_adapter]
         group_size = module.qalora_group_size[active_adapter]
 
         x_dropped = dropout(x) if module.training and not isinstance(dropout, nn.Identity) else x
         orig_shape = x_dropped.shape
 
+        # Reshape to 2D
         if len(orig_shape) > 2:
             x_flat = x_dropped.view(-1, module.in_features)
         else:
@@ -526,78 +545,13 @@ class QALoraLinearVariant(LoraVariant):
         batch_size, in_features = x_flat.shape
         pooled_features = in_features // group_size
 
-        x_pooled = x_flat.view(batch_size, pooled_features, group_size).mean(dim=2)
-        paper_scaling_factor = in_features / group_size
-        x_pooled_scaled = x_pooled * paper_scaling_factor
+        x_pooled = x_flat.view(batch_size, pooled_features, group_size).sum(dim=2)
 
-        lora_A_weight_reshaped = lora_A_weight.view(lora_A_weight.shape[0], pooled_features, group_size)
-        lora_A_pooled_weight = lora_A_weight_reshaped.mean(dim=2)
-        testing = lora_A_weight.t() @ lora_B_weight.t()
-        print(testing.shape)
-        intermediate = x_pooled_scaled @ lora_A_pooled_weight.t()
-        delta = intermediate @ lora_B_weight.t() * lora_scaling_coefficient
+        # LoRA computation
+        delta = x_pooled @ lora_A_weight.t() @ lora_B_weight.t() * scaling
 
+        # Reshape back
         if len(orig_shape) > 2:
             delta = delta.view(orig_shape[:-1] + (delta.size(-1),))
-            
-        # Das 'result' hier ist der Output der quantisierten Basisschicht.
-        # 'delta' ist der Beitrag von QA-LoRA.
-        final_result = result + delta
-        
-        # ================================================================= #
-        # TEIL 2: IHR NEUER CODE - DER OUTLIER-BEITRAG (KORRIGIERTE LOGIK)
-        # ================================================================= #
-        # Prüfen, ob die Outlier-Attribute existieren, die wir injiziert haben.
-        if hasattr(module.base_layer, "outlier_weights") and module.base_layer.outlier_indices.numel() > 0:
-            
-            input_tensor = x_dropped 
-            
-            # --- 1. Hochpräzisen Beitrag berechnen ---
-            # Erstelle eine temporäre Matrix in der Form (out, in), für die die Indizes gelten.
-            # WICHTIG: Leite dtype und device direkt von den outlier_weights ab, um den Fehler zu vermeiden.
-            temp_hp_matrix = torch.zeros(
-                (module.base_layer.out_features, module.base_layer.in_features),
-                device=module.base_layer.outlier_weights.device,
-                dtype=module.base_layer.outlier_weights.dtype
-            )
-            
-            # Jetzt stimmen die Datentypen überein.
-            temp_hp_matrix.view(-1).scatter_(
-                0,
-                module.base_layer.outlier_indices,
-                module.base_layer.outlier_weights
-            )
-            
-            # Transponiere sie zur (in, out) Form für die Multiplikation
-            sparse_outlier_matrix_hp = temp_hp_matrix.t()
-            
-            # Direkte Multiplikation: input @ weight
-            outlier_contribution_hp = input_tensor @ sparse_outlier_matrix_hp
 
-            # --- 2. Niedrigpräzisen Beitrag der Outlier berechnen ---
-            dequantized_weight_lp = module.base_layer.dequantize_weight() # Shape: (in_features, out_features)
-            
-            # Erstelle eine temporäre (out, in) Matrix
-            temp_lp_matrix = torch.zeros(
-                (module.base_layer.out_features, module.base_layer.in_features),
-                device=dequantized_weight_lp.device,
-                dtype=dequantized_weight_lp.dtype # Leite dtype von der dequantisierten Matrix ab
-            )
-            
-            # Extrahiere die LP-Werte aus der (transponierten) dequantisierten Matrix
-            lp_outlier_values = dequantized_weight_lp.t().contiguous().view(-1)[module.base_layer.outlier_indices]
-            
-            # Fülle die temporäre Matrix
-            temp_lp_matrix.view(-1).scatter_(0, module.base_layer.outlier_indices, lp_outlier_values)
-
-            # Transponiere sie zur (in, out) Form
-            sparse_outlier_matrix_lp = temp_lp_matrix.t()
-
-            # Direkte Multiplikation: input @ weight
-            outlier_contribution_lp = input_tensor @ sparse_outlier_matrix_lp.to(dtype=input_tensor.dtype)
-            
-            # --- 3. Das Ergebnis korrigieren ---
-            # Addiere den hochpräzisen Beitrag und subtrahiere den niedrigpräzisen Beitrag.
-            final_result = final_result + outlier_contribution_hp - outlier_contribution_lp
-                
-        return final_result
+        return result + delta
