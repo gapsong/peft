@@ -131,7 +131,7 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Percentage of outliers to identify for Outlier-Aware QA-LoRA."},
     )   
     report_to: str = field(
-        default="wandb",
+        default="None",
         metadata={"help": "The integration to report the results and logs to."},
     )
     skip_training: bool = field(
@@ -271,6 +271,30 @@ def load_or_quantize_model(
     model_id = base_model.replace("/", "_").replace("\\", "_")
     quantized_model_path = os.path.join(cache_dir, f"{model_id}_gptq_{bits}bit_groupsize_{qalora_group_size}_calibration_dataset_{calibration_dataset}")
 
+
+    # quantized_model_bad = AutoModelForCausalLM.from_pretrained(
+    #     quantized_model_path + "_bad", device_map="auto", torch_dtype=torch.float16, trust_remote_code=True
+    # )
+    # quantized_model_good = AutoModelForCausalLM.from_pretrained(
+    #     quantized_model_path + "_good", device_map="auto", torch_dtype=torch.float16, trust_remote_code=True
+    # )
+    # layer_name = "model.layers.0.self_attn.k_proj"
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     "HuggingFaceTB/SmolLM2-1.7B", device_map="auto", torch_dtype=torch.float16, trust_remote_code=True
+    # )
+    
+    # layer = model
+    # layer_good = quantized_model_bad
+    # layer_bad = quantized_model_good
+    # for part in layer_name.split('.'):
+    #     layer = getattr(layer, part)
+    #     layer_good = getattr(layer_good, part) 
+    #     layer_bad = getattr(layer_bad, part)
+
+    # error = layer.weight - layer_good.dequantize_weight()
+    # error2 = layer.weight - layer_bad.dequantize_weight()
+    # print(sum(sum(error, error2)))
+
     if os.path.exists(os.path.join(quantized_model_path, "config.json")):
         print(f"Cache hit: {quantized_model_path}")
         return AutoModelForCausalLM.from_pretrained(
@@ -286,6 +310,7 @@ def load_or_quantize_model(
         desc_act=False,
         sym=False,
         backend="auto_trainable",
+        quant_engine="spqr"
     )
     model = AutoModelForCausalLM.from_pretrained(
         base_model, device_map="auto", quantization_config=gptq_config, torch_dtype=torch.float16, trust_remote_code=True
@@ -584,7 +609,7 @@ def train():
         del og_model
         torch.cuda.empty_cache()
         print("🧹 Original model freed from memory")
-
+        
     elif script_args.training_mode == "spqr_outlier":
         print("🔧 Setting up QA-LoRA training...")
         model = load_or_quantize_model(
@@ -606,19 +631,53 @@ def train():
             qalora_group_size=script_args.qalora_group_size,
             r=script_args.lora_r,
             lora_alpha=script_args.lora_r,
-            # r=1,
-            # lora_alpha=1,
             target_modules=target_modules,
             lora_dropout=0,
             bias="none",
             init_lora_weights={
-                "method": "spqr-svd", 
-                "spqr_svd_adapter": torch.load("/home/nudel/Documents/peft/quantized_models/HuggingFaceTB_SmolLM2-1.7B_gptq_2bit_groupsize_32_calibration_dataset_c4/spqr_adapter_svd/adapter_model.pt")
+                "method": "spqr_outlier", 
+                "spqr_all_sparse_outliers_adapter": torch.load("/home/gap/Documents/peft/quantized_models/HuggingFaceTB_SmolLM2-1.7B_gptq_2bit_groupsize_32_calibration_dataset_c4/adapter_model.pt")
             }
         )
-        model = get_peft_model(model, lora_config)
+        model = get_peft_model(model, lora_config, adapter_name="error_correction", mixed=True)
         adapter_name = model.active_adapter
-        config = model.peft_config[adapter_name]
+        config = model.peft_config["error_correction"]
+
+        if hasattr(config, "init_lora_weights") and isinstance(config.init_lora_weights, dict):
+            print("Entferne nicht serialisierbare Tensor-Daten aus der Lora-Konfiguration vor dem Speichern...")
+            if "spqr_all_sparse_outliers_adapter" in config.init_lora_weights:
+                del config.init_lora_weights["spqr_all_sparse_outliers_adapter"]
+            if "method" in config.init_lora_weights:
+                del config.init_lora_weights["method"]
+        
+        
+        # Cleanup
+        print("❄️ 4. Fehlerkorrektur-Adapter einfrieren...")
+        for name, param in model.named_parameters():
+            if "error_correction" in name:
+                param.requires_grad = False
+
+        # ==============================================================================
+        # SCHRITT 3: TASK-ADAPTER HINZUFÜGEN (GAUSS-INIT, TRAINABLE)
+        # ==============================================================================
+        print("🎨 5. Trainierbaren Task-Adapter ('task_adapter') hinzufügen...")
+
+        train_config = LoraConfig(
+            r=script_args.lora_r,
+            lora_alpha=script_args.lora_r,
+            use_qalora=True,
+            qalora_group_size=script_args.qalora_group_size,
+            init_lora_weights="gaussian",
+            target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
+            lora_dropout=0,
+            bias="none",
+        )
+
+        model.add_adapter("task_adapter", train_config)
+        print("✅ 'task_adapter' hinzugefügt und zufällig initialisiert.")
+
+        print("🚀 6. 'task_adapter' als aktiv für das Training setzen...")
+        model.set_adapter(["task_adapter", "error_correction"])
 
         # Überprüfen, ob die Initialisierungsmethode verwendet wurde und die problematischen Daten enthält
         if hasattr(config, "init_lora_weights") and isinstance(config.init_lora_weights, dict):
@@ -1030,13 +1089,35 @@ def train():
         # tasks = "wikitext,piqa,tinyArc,tinyHellaswag,tinyGSM8k,tinyMMLU"
         tasks = "wikitext,piqa"
         harness_file_name = "lm_harness_results"
+        # run_lm_harness_and_print_results(
+        #     model=model,
+        #     tokenizer=tokenizer,
+        #     tasks=tasks,
+        #     num_fewshot=1,
+        #     limit=30,
+        #     per_device_eval_batch_size=1,
+        #     output_dir=evaluation_dir,
+        #     file_name=harness_file_name,
+        # )
+        # Get one sample and run it through the model
+        
+        sample = train_dataset[0]
+        # Collate into a batch (batch size 1)
+        batch = data_collator([sample])
+        # Move tensors to model device
+        device = next(model.parameters()).device
+        batch = {k: v.to(device) for k, v in batch.items()}
+        with torch.no_grad():
+            output = model(**batch)
+        print("Sample output:", output)
+        
         run_lm_harness_and_print_results(
             model=model,
             tokenizer=tokenizer,
             tasks=tasks,
             num_fewshot=1,
             limit=30,
-            per_device_eval_batch_size=2,
+            per_device_eval_batch_size=1,
             output_dir=evaluation_dir,
             file_name=harness_file_name,
         )
@@ -1047,10 +1128,10 @@ def train():
         # generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name)
         # print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
 
-        metrics_path = os.path.join(evaluation_dir, "training_metrics.json")
-        with open(metrics_path, 'w') as f:
-            json.dump(training_metrics, f, indent=4)
-        print(f"✅ Trainingsmetriken gespeichert in: {metrics_path}")
+        # metrics_path = os.path.join(evaluation_dir, "training_metrics.json")
+        # with open(metrics_path, 'w') as f:
+        #     json.dump(training_metrics, f, indent=4)
+        # print(f"✅ Trainingsmetriken gespeichert in: {metrics_path}")
     else:
         print("⏭️ Evaluation übersprungen, wie angegeben.")
 

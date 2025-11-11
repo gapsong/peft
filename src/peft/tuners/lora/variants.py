@@ -354,15 +354,16 @@ class QALoraLinearVariant(LoraVariant):
         r = old_lora_A_layer.out_features
         device = old_lora_A_layer.weight.device
         dtype = old_lora_A_layer.weight.dtype
-
-        new_lora_A_layer = nn.Linear(
-            old_lora_A_layer.in_features // module.qalora_group_size[adapter_name],
-            r,
-            bias=False,
-            device=device,
-            dtype=dtype,
-        )
-        # module.lora_A[adapter_name] = new_lora_A_layer
+        
+        # if module.in_features == old_lora_A_layer.in_features:
+        #     new_lora_A_layer = nn.Linear(
+        #         old_lora_A_layer.in_features // module.qalora_group_size[adapter_name],
+        #         r,
+        #         bias=False,
+        #         device=device,
+        #         dtype=dtype,
+        #     )
+        #     module.lora_A[adapter_name] = new_lora_A_layer
 
     @staticmethod
     def get_delta_weight(module: Linear, active_adapter: str) -> torch.Tensor:
@@ -506,9 +507,6 @@ class QALoraLinearVariant(LoraVariant):
 
     @staticmethod
     def forward(module: Linear, active_adapter: str, x: torch.Tensor, result: torch.Tensor) -> torch.Tensor:
-        # ================================================================= #
-        # TEIL 1: Bestehender QA-LoRA Code (bleibt 100% identisch)
-        # ================================================================= #
         lora_A_weight = module.lora_A[active_adapter].weight
         lora_B_weight = module.lora_B[active_adapter].weight
         dropout = module.lora_dropout[active_adapter]
@@ -523,19 +521,21 @@ class QALoraLinearVariant(LoraVariant):
         else:
             x_flat = x_dropped
 
-        batch_size, in_features = x_flat.shape
-        pooled_features = in_features // group_size
+        if module.in_features != module.lora_A[active_adapter].in_features:
+            batch_size, in_features = x_flat.shape
+            pooled_features = in_features // group_size
 
-        x_pooled = x_flat.view(batch_size, pooled_features, group_size).mean(dim=2)
-        paper_scaling_factor = in_features / group_size
-        x_pooled_scaled = x_pooled * paper_scaling_factor
+            x_pooled = x_flat.view(batch_size, pooled_features, group_size).sum(dim=2)
+            x_input = x_pooled
+        else:
+            x_input = x
+        
+        # LoRA-Berechnung (bleibt gleich)
+        delta = (x_input @ lora_A_weight.t() @ lora_B_weight.t()) * lora_scaling_coefficient
 
-        lora_A_weight_reshaped = lora_A_weight.view(lora_A_weight.shape[0], pooled_features, group_size)
-        lora_A_pooled_weight = lora_A_weight_reshaped.mean(dim=2)
-        testing = lora_A_weight.t() @ lora_B_weight.t()
-        print(testing.shape)
-        intermediate = x_pooled_scaled @ lora_A_pooled_weight.t()
-        delta = intermediate @ lora_B_weight.t() * lora_scaling_coefficient
+        # # print(testing.shape)
+        # intermediate = x_pooled_scaled @ lora_A_pooled_weight.t()
+        # delta = intermediate @ lora_B_weight.t() * lora_scaling_coefficient
 
         if len(orig_shape) > 2:
             delta = delta.view(orig_shape[:-1] + (delta.size(-1),))
