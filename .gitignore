@@ -158,4 +158,5 @@ trainer_output
 *.tex
 visualizations*
 spqr_visualizations
+weight_visualizations
 *.tex

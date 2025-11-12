@@ -559,7 +559,7 @@ def train():
         print("📥 Loading original model for error-svd initialization...")
         og_model = AutoModelForCausalLM.from_pretrained(
             script_args.model_name_or_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float16,
             device_map="auto"
         )
         
@@ -780,7 +780,7 @@ def train():
         print("🔧 Setting up PiSSA training...")
         model = transformers.AutoModelForCausalLM.from_pretrained(
             script_args.model_name_or_path,
-            # torch_dtype=torch.bfloat16,
+            # torch_dtype=torch.float16,
             device_map="auto",
         )
 
@@ -1056,7 +1056,7 @@ def train():
         print("Applying GPTQ post-quantization...")
         from peft.tuners.lora.gptq import merge_gptq_lora_to_linear
 
-        model = merge_gptq_lora_to_linear(model, adapter_names=None, dtype=torch.bfloat16)
+        model = merge_gptq_lora_to_linear(model, adapter_names=None, dtype=torch.float16)
         temp_model_path = "./temp_merged_model"
 
         model.save_pretrained(temp_model_path)
@@ -1073,7 +1073,7 @@ def train():
             temp_model_path,
             quantization_config=gptq_config,
             device_map=None,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float16,
         )  
         if torch.cuda.is_available():
             model.to("cuda") 
@@ -1100,16 +1100,27 @@ def train():
         #     file_name=harness_file_name,
         # )
         # Get one sample and run it through the model
+        # sample = train_dataset[0]
+        # # Collate into a batch (batch size 1)
+        # batch = data_collator([sample])
+        # # Move tensors to model device
+        # device = next(model.parameters()).device
+        # batch = {k: v.to(device) for k, v in batch.items()}
+        # with torch.no_grad():
+        #     output = model(**batch)
+        # print("Sample output:", output)
         
-        sample = train_dataset[0]
-        # Collate into a batch (batch size 1)
-        batch = data_collator([sample])
-        # Move tensors to model device
-        device = next(model.parameters()).device
-        batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.no_grad():
-            output = model(**batch)
-        print("Sample output:", output)
+        # model = model.merge_and_unload()
+        
+        # sample = train_dataset[0]
+        # # Collate into a batch (batch size 1)
+        # batch = data_collator([sample])
+        # # Move tensors to model device
+        # device = next(model.parameters()).device
+        # batch = {k: v.to(device) for k, v in batch.items()}
+        # with torch.no_grad():
+        #     output = model(**batch)
+        # print("Sample output:", output)
         
         run_lm_harness_and_print_results(
             model=model,
@@ -1128,10 +1139,10 @@ def train():
         # generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name)
         # print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
 
-        # metrics_path = os.path.join(evaluation_dir, "training_metrics.json")
-        # with open(metrics_path, 'w') as f:
-        #     json.dump(training_metrics, f, indent=4)
-        # print(f"✅ Trainingsmetriken gespeichert in: {metrics_path}")
+        metrics_path = os.path.join(evaluation_dir, "training_metrics.json")
+        with open(metrics_path, 'w') as f:
+            json.dump(training_metrics, f, indent=4)
+        print(f"✅ Trainingsmetriken gespeichert in: {metrics_path}")
     else:
         print("⏭️ Evaluation übersprungen, wie angegeben.")
 

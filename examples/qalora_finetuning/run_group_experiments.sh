@@ -32,16 +32,18 @@ fi
 export BASE_OUTPUT_DIR
 echo "BASE_OUTPUT_DIR=$BASE_OUTPUT_DIR"
 # --- Iteration Parameters ---
-TRAINING_MODES=("qalora" "pissa_rank_analysis" "qalora_svd_error_two_adapter") 
+# TRAINING_MODES=("qalora") 
+TRAINING_MODES=("qalora_svd_error") 
+# TRAINING_MODES=("qalora_svd_error_two_adapter") 
 # TRAINING_MODES=("pissa_rank_analysis" "qalora_svd_error_two_adapter") 
-LORA_RANKS=(8 16 32 64)
+LORA_RANKS=(8 16 32 64 128)
 BITS_LIST=(2 3)
 CALIBRATION_DATASETS=("c4")
-QALORA_GROUP_SIZES=(32 128)
+QALORA_GROUP_SIZES=(32 64 128)
 
 # --- Training Configuration ---
 DATA_PATH="yahma/alpaca-cleaned"
-DATASET_SPLIT="train[:10000]"
+DATASET_SPLIT="train[:5000]"
 NUM_TRAIN_EPOCHS=2
 PER_DEVICE_TRAIN_BATCH_SIZE=4
 LEARNING_RATE=1e-4

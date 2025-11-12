@@ -351,19 +351,9 @@ class QALoraLinearVariant(LoraVariant):
         module.qalora_group_size[adapter_name] = qalora_group_size
 
         old_lora_A_layer = module.lora_A[adapter_name]
-        r = old_lora_A_layer.out_features
-        device = old_lora_A_layer.weight.device
-        dtype = old_lora_A_layer.weight.dtype
-        
-        # if module.in_features == old_lora_A_layer.in_features:
-        #     new_lora_A_layer = nn.Linear(
-        #         old_lora_A_layer.in_features // module.qalora_group_size[adapter_name],
-        #         r,
-        #         bias=False,
-        #         device=device,
-        #         dtype=dtype,
-        #     )
-        #     module.lora_A[adapter_name] = new_lora_A_layer
+
+        if module.in_features == old_lora_A_layer.in_features:
+            module.pool_layers_and_init_normal(adapter_name) 
 
     @staticmethod
     def get_delta_weight(module: Linear, active_adapter: str) -> torch.Tensor:
@@ -401,40 +391,13 @@ class QALoraLinearVariant(LoraVariant):
         lora_alpha = module.lora_alpha[active_adapter]
         scales = module.base_layer.scales
         qzeros_packed = module.base_layer.qzeros
-
-        # Holen Sie die Gruppengrößen aus den Modul-Attributen
-        qalora_group_size = module.qalora_group_size[active_adapter]
-        gptq_group_size = getattr(module.base_layer, "group_size", 32)
-
-        amplification_factor = kwargs.get("amplification_factor", 4.0)
         effective_scale = (lora_alpha / lora_r) 
+        group_size = module.qalora_group_size[active_adapter]
         with torch.no_grad():
-            # --- 2. LoRA-Beitrag auf der gepoolten Ebene berechnen ---
-            # Dies ergibt eine "low-resolution" Delta-Matrix: delta_W_pooled
-            # Shape: [out_features, in_features / qalora_group_size]
-            delta_W_pooled = lora_B.weight @ lora_A.weight
-
-            # --- 3. "Un-Pooling": Den Beitrag auf die volle Dimension hochskalieren ---
-            # Wir wiederholen jede Spalte (die einem Pool entspricht) `qalora_group_size` mal,
-            # um die ursprüngliche `in_features`-Dimension wiederherzustellen.
-            # Shape: [out_features, in_features]
-            # delta_W_full = delta_W_pooled.repeat_interleave(qalora_group_size, dim=1)
-
-            # --- 4. Den "Full-Resolution-Shift" für die qzeros berechnen ---
-            # Zuerst transponieren wir, um die Form an die `scales` anzupassen.
-            # Shape: [in_features, out_features]
-            lora_contribution_full = delta_W_pooled
-
-            # Jetzt gruppieren wir diesen vollen Beitrag gemäß der GPTQ-Gruppengröße,
-            # indem wir den Mittelwert über jede Gruppe bilden.
-            # Shape: [in_features / gptq_group_size, out_features]
-            num_groups = scales.shape[0]
-            lora_contribution_grouped = lora_contribution_full.view(num_groups, gptq_group_size, -1).mean(dim=1)
-
-            # --- 5. LoRA-Adjustment im Gewichtsraum berechnen ---
-            # adjustment = grouped_lora_contribution * effective_scale
-            # Dies ist bereits im Gewichtsraum, nicht im quantisierten Raum
-            weight_adjustment = lora_contribution_grouped * effective_scale
+            lora_A_pooled = lora_A.weight
+            lora_B_full = lora_B.weight
+            
+            delta_pooled = effective_scale * (lora_B_full @ lora_A_pooled).t() / scales / 8
 
             # --- 6. Originale qzeros entpacken und vollständig dequantisieren ---
             bits = getattr(module.base_layer, "bits", 4)
@@ -490,16 +453,21 @@ class QALoraLinearVariant(LoraVariant):
 
             # --- 7. LoRA-Shift auf dequantisierte qzeros anwenden ---
             # Jetzt können wir den weight_adjustment direkt subtrahieren
-            new_qzeros_fp16 = (dequantized_qzeros - weight_adjustment.to(torch.float32)).to(torch.float16)
+            new_qzeros_fp16 = (dequantized_qzeros.to(torch.float32) - delta_pooled.to(torch.float32)).to(torch.float16)
 
             # --- 8. Alten qzeros-Parameter durch den neuen ersetzen ---
-            if hasattr(module.base_layer, "qzeros"):
-                delattr(module.base_layer, "qzeros")
-            module.base_layer.register_parameter("zeros", torch.nn.Parameter(new_qzeros_fp16, requires_grad=False))
+            # if hasattr(module.base_layer, "qzeros"):
+            #     delattr(module.base_layer, "qzeros")
+            # Debug: Print shapes and ranges
 
-            print(
-                f"Merged adapter into qzeros for layer. New zeros shape: {new_qzeros_fp16.shape}, dtype: {new_qzeros_fp16.dtype}, bits: {bits}"
-            )
+            # Update qzeros parameter
+            module.base_layer.qzeros = torch.nn.Parameter(new_qzeros_fp16.contiguous(), requires_grad=False)
+            module.merged_adapters.append(active_adapter)
+            
+
+            # print(
+            #     f"Merged adapter into qzeros for layer. New zeros shape: {new_qzeros_fp16.shape}, dtype: {new_qzeros_fp16.dtype}, bits: {bits}"
+            # )
 
     @staticmethod
     def unmerge(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:

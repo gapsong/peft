@@ -286,6 +286,8 @@ class LoraLayer(BaseTunerLayer):
                         
                     with gather_params_ctx(base_layer.dequantize_weight()):
                         self.error_svd_init(adapter_name, init_dict_for_this_layer)
+                        # nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
+                        # nn.init.zeros_(self.lora_B[adapter_name].weight)
                     print(f"✅ Init layer adapter {layer_name} with error-svd")
                 else:
                     with gather_params_ctx(base_layer.dequantize_weight()):

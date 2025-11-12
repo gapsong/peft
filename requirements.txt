@@ -19,3 +19,4 @@ matplotlib
 wandb
 lm_eval
 datasets
+alpaca_eval
