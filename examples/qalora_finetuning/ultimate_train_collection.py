@@ -131,7 +131,7 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Percentage of outliers to identify for Outlier-Aware QA-LoRA."},
     )   
     report_to: str = field(
-        default="None",
+        default="wandb",
         metadata={"help": "The integration to report the results and logs to."},
     )
     skip_training: bool = field(
