@@ -397,7 +397,7 @@ class QALoraLinearVariant(LoraVariant):
             lora_A_pooled = lora_A.weight
             lora_B_full = lora_B.weight
             
-            delta_pooled = effective_scale * (lora_B_full @ lora_A_pooled).t() / scales / 8
+            delta_pooled = effective_scale * (lora_B_full @ lora_A_pooled).t()
 
             # --- 6. Originale qzeros entpacken und vollständig dequantisieren ---
             bits = getattr(module.base_layer, "bits", 4)
