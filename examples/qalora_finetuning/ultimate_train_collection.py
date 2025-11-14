@@ -131,7 +131,7 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Percentage of outliers to identify for Outlier-Aware QA-LoRA."},
     )   
     report_to: str = field(
-        default="None",
+        default="wandb",
         metadata={"help": "The integration to report the results and logs to."},
     )
     skip_training: bool = field(
@@ -1088,40 +1088,20 @@ def train():
 
         from eval_peft import run_lm_harness_and_print_results
         # tasks = "wikitext,piqa,tinyArc,tinyHellaswag,tinyGSM8k,tinyMMLU"
-        tasks = "wikitext,piqa"
+        tasks = "wikitext, piqa"
         harness_file_name = "lm_harness_results"
         # run_lm_harness_and_print_results(
         #     model=model,
         #     tokenizer=tokenizer,
         #     tasks=tasks,
         #     num_fewshot=1,
-        #     limit=30,
+        #     limit=EVAL_SAMPLES,
         #     per_device_eval_batch_size=1,
         #     output_dir=evaluation_dir,
         #     file_name=harness_file_name,
         # )
-        # Get one sample and run it through the model
-        # sample = train_dataset[0]
-        # # Collate into a batch (batch size 1)
-        # batch = data_collator([sample])
-        # # Move tensors to model device
-        # device = next(model.parameters()).device
-        # batch = {k: v.to(device) for k, v in batch.items()}
-        # with torch.no_grad():
-        #     output = model(**batch)
-        # print("Sample output:", output)
         
         # model = model.merge_and_unload()
-        
-        # sample = train_dataset[0]
-        # # Collate into a batch (batch size 1)
-        # batch = data_collator([sample])
-        # # Move tensors to model device
-        # device = next(model.parameters()).device
-        # batch = {k: v.to(device) for k, v in batch.items()}
-        # with torch.no_grad():
-        #     output = model(**batch)
-        # print("Sample output:", output)
         
         run_lm_harness_and_print_results(
             model=model,
