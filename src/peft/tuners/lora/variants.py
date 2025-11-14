@@ -392,7 +392,6 @@ class QALoraLinearVariant(LoraVariant):
         scales = module.base_layer.scales
         qzeros_packed = module.base_layer.qzeros
         effective_scale = (lora_alpha / lora_r) 
-        group_size = module.qalora_group_size[active_adapter]
         with torch.no_grad():
             lora_A_pooled = lora_A.weight
             lora_B_full = lora_B.weight
@@ -451,23 +450,12 @@ class QALoraLinearVariant(LoraVariant):
                 unpacked_qzeros = unpacked_qzeros.view(qzeros_packed.shape[0], -1)[:, :out_features]  # [G, C], int32
                 dequantized_qzeros = unpacked_qzeros.to(torch.float32) * scales.to(torch.float32)
 
-            # --- 7. LoRA-Shift auf dequantisierte qzeros anwenden ---
-            # Jetzt können wir den weight_adjustment direkt subtrahieren
             new_qzeros_fp16 = (dequantized_qzeros.to(torch.float32) - delta_pooled.to(torch.float32)).to(torch.float16)
-
-            # --- 8. Alten qzeros-Parameter durch den neuen ersetzen ---
-            # if hasattr(module.base_layer, "qzeros"):
-            #     delattr(module.base_layer, "qzeros")
-            # Debug: Print shapes and ranges
-
-            # Update qzeros parameter
             module.base_layer.qzeros = torch.nn.Parameter(new_qzeros_fp16.contiguous(), requires_grad=False)
             module.merged_adapters.append(active_adapter)
-            
-
-            # print(
-            #     f"Merged adapter into qzeros for layer. New zeros shape: {new_qzeros_fp16.shape}, dtype: {new_qzeros_fp16.dtype}, bits: {bits}"
-            # )
+            print(
+                f"Merged adapter into qzeros for layer. New zeros shape: {new_qzeros_fp16.shape}, dtype: {new_qzeros_fp16.dtype}, bits: {bits}"
+            )
 
     @staticmethod
     def unmerge(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
@@ -512,60 +500,4 @@ class QALoraLinearVariant(LoraVariant):
         # 'delta' ist der Beitrag von QA-LoRA.
         final_result = result + delta
         
-        # ================================================================= #
-        # TEIL 2: IHR NEUER CODE - DER OUTLIER-BEITRAG (KORRIGIERTE LOGIK)
-        # ================================================================= #
-        # Prüfen, ob die Outlier-Attribute existieren, die wir injiziert haben.
-        if hasattr(module.base_layer, "outlier_weights") and module.base_layer.outlier_indices.numel() > 0:
-            
-            input_tensor = x_dropped 
-            
-            # --- 1. Hochpräzisen Beitrag berechnen ---
-            # Erstelle eine temporäre Matrix in der Form (out, in), für die die Indizes gelten.
-            # WICHTIG: Leite dtype und device direkt von den outlier_weights ab, um den Fehler zu vermeiden.
-            temp_hp_matrix = torch.zeros(
-                (module.base_layer.out_features, module.base_layer.in_features),
-                device=module.base_layer.outlier_weights.device,
-                dtype=module.base_layer.outlier_weights.dtype
-            )
-            
-            # Jetzt stimmen die Datentypen überein.
-            temp_hp_matrix.view(-1).scatter_(
-                0,
-                module.base_layer.outlier_indices,
-                module.base_layer.outlier_weights
-            )
-            
-            # Transponiere sie zur (in, out) Form für die Multiplikation
-            sparse_outlier_matrix_hp = temp_hp_matrix.t()
-            
-            # Direkte Multiplikation: input @ weight
-            outlier_contribution_hp = input_tensor @ sparse_outlier_matrix_hp
-
-            # --- 2. Niedrigpräzisen Beitrag der Outlier berechnen ---
-            dequantized_weight_lp = module.base_layer.dequantize_weight() # Shape: (in_features, out_features)
-            
-            # Erstelle eine temporäre (out, in) Matrix
-            temp_lp_matrix = torch.zeros(
-                (module.base_layer.out_features, module.base_layer.in_features),
-                device=dequantized_weight_lp.device,
-                dtype=dequantized_weight_lp.dtype # Leite dtype von der dequantisierten Matrix ab
-            )
-            
-            # Extrahiere die LP-Werte aus der (transponierten) dequantisierten Matrix
-            lp_outlier_values = dequantized_weight_lp.t().contiguous().view(-1)[module.base_layer.outlier_indices]
-            
-            # Fülle die temporäre Matrix
-            temp_lp_matrix.view(-1).scatter_(0, module.base_layer.outlier_indices, lp_outlier_values)
-
-            # Transponiere sie zur (in, out) Form
-            sparse_outlier_matrix_lp = temp_lp_matrix.t()
-
-            # Direkte Multiplikation: input @ weight
-            outlier_contribution_lp = input_tensor @ sparse_outlier_matrix_lp.to(dtype=input_tensor.dtype)
-            
-            # --- 3. Das Ergebnis korrigieren ---
-            # Addiere den hochpräzisen Beitrag und subtrahiere den niedrigpräzisen Beitrag.
-            final_result = final_result + outlier_contribution_hp - outlier_contribution_lp
-                
         return final_result
