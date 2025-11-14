@@ -127,10 +127,10 @@ def evaluate_with_lm_eval(model, tokenizer, tasks, num_fewshot=5, limit=None, pe
         limit=limit,
         batch_size=per_device_eval_batch_size,
     )
-    wandb_logger = WandbLogger()  # or empty if wandb.init(...) already called before
-    wandb_logger.post_init(results)
-    wandb_logger.log_eval_result()
-    wandb_logger.log_eval_samples(results["samples"])  # if log_samples
+    # wandb_logger = WandbLogger()  # or empty if wandb.init(...) already called before
+    # wandb_logger.post_init(results)
+    # wandb_logger.log_eval_result()
+    # wandb_logger.log_eval_samples(results["samples"])  # if log_samples
     
     # Clean up
     del lm_harness_model
