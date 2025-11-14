@@ -694,7 +694,6 @@ class LoraLayer(BaseTunerLayer):
                 g = math.gcd(n_full, g) or 1
             except Exception:
                 g = 1
-        c = float(n_full) / float(g) if g > 0 else 1.0
 
         def _orient_out_in(W: torch.Tensor) -> torch.Tensor:
             if W.dim() != 2: raise ValueError(f"[error-svd] Expected 2D weight, got {tuple(W.shape)}")
@@ -749,7 +748,7 @@ class LoraLayer(BaseTunerLayer):
         A_svd = torch.diag(sqrtS) @ Vh_r
 
         # Adjust for QA-LoRA scaling factor 'c'
-        A_store = A_svd / max(c, 1e-12)
+        A_store = A_svd / max(g, 1e-12)
 
         # Assign weights
         self.lora_A[adapter_name].weight.data.copy_(A_store.to(self.lora_A[adapter_name].weight.dtype))
@@ -757,7 +756,7 @@ class LoraLayer(BaseTunerLayer):
 
         # Optional: Diagnostic print
         try:
-            approx = s * (B @ (A_store * c))
+            approx = s * (B @ (A_store * g))
             rel_err = torch.linalg.norm(E - approx) / (torch.linalg.norm(E) + 1e-12)
             print(f"[error-svd] Init successful for {adapter_name}. Relative error: {rel_err.item():.3e}")
         except Exception:
