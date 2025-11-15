@@ -1095,30 +1095,30 @@ def train():
         # tasks = "wikitext,piqa,tinyArc,tinyHellaswag,tinyGSM8k,tinyMMLU"
         tasks = "wikitext, piqa"
         harness_file_name = "lm_harness_results"
-        # run_lm_harness_and_print_results(
-        #     model=model,
-        #     tokenizer=tokenizer,
-        #     tasks=tasks,
-        #     num_fewshot=1,
-        #     limit=EVAL_SAMPLES,
-        #     per_device_eval_batch_size=1,
-        #     output_dir=evaluation_dir,
-        #     file_name=harness_file_name,
-        # )
-        
-        # model = model.merge_and_unload()
-        
         run_lm_harness_and_print_results(
             model=model,
             tokenizer=tokenizer,
             tasks=tasks,
             num_fewshot=1,
             limit=EVAL_SAMPLES,
-            per_device_eval_batch_size=2,
+            per_device_eval_batch_size=1,
             output_dir=evaluation_dir,
             file_name=harness_file_name,
         )
-        print(f"✅ LM-Harness Ergebnisse gespeichert in: {evaluation_dir}")
+        
+        # model = model.merge_and_unload()
+        
+        # run_lm_harness_and_print_results(
+        #     model=model,
+        #     tokenizer=tokenizer,
+        #     tasks=tasks,
+        #     num_fewshot=1,
+        #     limit=EVAL_SAMPLES,
+        #     per_device_eval_batch_size=2,
+        #     output_dir=evaluation_dir,
+        #     file_name=harness_file_name,
+        # )
+        # print(f"✅ LM-Harness Ergebnisse gespeichert in: {evaluation_dir}")
 
         # from eval_peft import generate_alpaca_response
         # alpaca_file_name = "alpaca_eval_results"

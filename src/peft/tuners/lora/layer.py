@@ -236,10 +236,10 @@ class LoraLayer(BaseTunerLayer):
             base_layer = self.get_base_layer() # if it got init already do not init it again. If we load it with a quantized layer it should not init it again since we have init it already before
             if hasattr(base_layer, "weight"):
                 with gather_params_ctx(self.base_layer.weight):
-                    self.daniel_init(adapter_name, init_lora_weights)
+                    self.daniel_init_svd_pooled_aware(adapter_name, init_lora_weights)
                 print("Init layer adapter with daniel")
             else:
-                print("Not init with daniel")
+                print("Not init with daniel, we have init it already and just need to load the svd")
         elif (
             isinstance(init_lora_weights, str) and init_lora_weights.startswith("avg-group-pooling")
         ) or (
@@ -300,7 +300,6 @@ class LoraLayer(BaseTunerLayer):
                     with gather_params_ctx(base_layer.dequantize_weight()):
                         self.pool_layers_and_init_normal(adapter_name)
                     print(f"✅ Init layer and pooled down {layer_name}")
-
         elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
             with gather_params_ctx(self.get_base_layer().weight):
                 self.pissa_init(adapter_name, init_lora_weights)
@@ -460,6 +459,89 @@ class LoraLayer(BaseTunerLayer):
         self.get_base_layer().weight.data = weight_residual.to(self.get_base_layer().weight.dtype)
         print("✅ Basis-Layer wurde mit dem Residual aktualisiert.")
 
+    def daniel_init_svd_pooled_aware(self, adapter_name, init_lora_weights):
+        """
+        Initialisiert LoRA-Adapter A und B via "SVD Pooled Aware"-Methode.
+        Die SVD wird auf einer strukturell gepoolten Version der Gewichtsmatrix durchgeführt.
+        """
+        # 1. Leite die wahren Dimensionen aus den LoRA-Layern ab
+        out_features = self.lora_B[adapter_name].weight.shape[0]
+        in_features = self.lora_A[adapter_name].weight.shape[1]
+        rank = self.r[adapter_name]
+        group_size = 32  # Deine definierte Gruppengröße für das Pooling
+
+        # 2. Hole die Gewichte und prüfe die Form
+        weight = self.get_base_layer().weight.clone().to(torch.float32)
+        
+        needs_transpose = False
+        if weight.shape == (out_features, in_features):
+            print("✅ Dimensionen stimmen - kein Transpose nötig")
+        elif weight.shape == (in_features, out_features):
+            print("⚠️  Dimensionen vertauscht - Transpose erforderlich")
+            weight = weight.T
+            needs_transpose = True
+        else:
+            raise ValueError(f"Unerwartete Gewichtsform: {weight.shape}")
+
+        # ========================================================================
+        # NEUER TEIL: "SVD Pooled Aware"
+        # ========================================================================
+        print(f"🔄 Erstelle eine gepoolte Gewichtsmatrix für die SVD (Gruppengröße: {group_size})")
+
+        if in_features % group_size != 0:
+            raise ValueError(f"in_features ({in_features}) muss durch group_size ({group_size}) teilbar sein.")
+        
+        num_groups = in_features // group_size
+
+        # Reshape der Gewichtsmatrix, um die Spalten zu gruppieren
+        # Shape: (out_features, in_features) -> (out_features, num_groups, group_size)
+        weight_grouped = weight.view(out_features, num_groups, group_size)
+
+        # Erstelle die gepoolte Gewichtsmatrix durch Mittelung der Spaltengruppen
+        # Shape: (out_features, num_groups)
+        weight_pooled = weight_grouped.mean(dim=2)
+        
+        print(f"✅ SVD wird auf gepoolter Matrix der Form {weight_pooled.shape} durchgeführt.")
+        # ========================================================================
+        # ENDE DES NEUEN TEILS
+        # ========================================================================
+
+        # 4. Führe SVD auf der *gepoolten* Matrix durch
+        if init_lora_weights == "daniel":
+            U, S, Vh = torch.linalg.svd(weight_pooled.data, full_matrices=False)
+        else:
+            raise ValueError(f"Unknown init_lora_weights: {init_lora_weights}")
+
+        Ur = U[:, :rank]
+        Sr = S[:rank]
+        Vhr = Vh[:rank, :]
+
+        Sr_scaled = Sr / self.scaling[adapter_name]
+        sqrt_Sr = torch.sqrt(Sr_scaled)
+
+        lora_B = Ur @ torch.diag(sqrt_Sr)
+
+        lora_A_pooled = torch.diag(sqrt_Sr) @ Vhr
+
+        lora_A = lora_A_pooled.repeat_interleave(group_size, dim=1)
+
+        print(f"✅ lora_A wurde von {lora_A_pooled.shape} auf {lora_A.shape} erweitert. Für die SVD un die resdiual berechnung, aber wir speichern hier die gepoolte Version")
+
+        # 6. Weise die neuen Gewichte zu (die Formen müssen jetzt passen)
+        self.lora_A[adapter_name].weight.data = lora_A_pooled.to(self.lora_A[adapter_name].weight.dtype)
+        self.lora_B[adapter_name].weight.data = lora_B.to(self.lora_B[adapter_name].weight.dtype)
+
+        # 7. Aktualisiere die ursprüngliche Gewichtsmatrix
+        svd_adapter = self.scaling[adapter_name] * (lora_B @ lora_A)
+        weight_residual = weight.data - svd_adapter
+
+        # 8. Bringe die aktualisierten Gewichte zurück in ihre Originalform
+        if needs_transpose:
+            print("🔄 Transponiere weight_residual zurück zur ursprünglichen Form")
+            weight_residual = weight_residual.T
+
+        self.get_base_layer().weight.data = weight_residual.to(torch.bfloat16)
+    
 
     def daniel_init(self, adapter_name, init_lora_weights):
         """
