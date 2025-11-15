@@ -587,8 +587,9 @@ def train():
             init_lora_weights={
                 "method": "error-svd", 
                 "original_weights_map": original_weights_map,
-                "group_size": script_args.qalora_group_size
-            }
+                "group_size": script_args.qalora_group_size,
+                "all_hessian_inverse_layers": torch.load("/home/gap/Documents/peft/quantized_models/HuggingFaceTB_SmolLM2-1.7B_gptq_2bit_groupsize_32_calibration_dataset_c4/all_hessian_inverse_layers/all_hessian_inverse_layers.pt"),
+            },
         )
         del original_weights_map
         model = get_peft_model(model, lora_config)
@@ -604,6 +605,10 @@ def train():
                 del config.init_lora_weights["original_weights_map"]
             if "W_orig" in config.init_lora_weights:
                 del config.init_lora_weights["W_orig"]
+            if "all_hessian_inverse_layers" in config.init_lora_weights:
+                del config.init_lora_weights["all_hessian_inverse_layers"]
+            if "method" in config.init_lora_weights:
+                del config.init_lora_weights["method"]
         
         # Cleanup
         del og_model
@@ -857,7 +862,7 @@ def train():
                 if "base_layer.weight" in key:
                     clean_key = key.replace(".base_layer.weight", ".weight")
                     clean_state_dict[clean_key] = value.clone()
-                elif "weight" in key and "lora" not in key and "base_layer" not in key:
+                elif "weight" in key and "lora" not in key and "base_layer" not in key and "outlier" not in key:
                     clean_state_dict[key] = value.clone()
 
             if "lm_head.weight" in peft_model.state_dict():
