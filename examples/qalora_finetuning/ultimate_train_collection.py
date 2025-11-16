@@ -23,6 +23,7 @@ from typing import Optional, List
 import numpy as np
 import torch
 import transformers
+# from utils import main, compare_models
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, GPTQConfig, Trainer
 from transformers.trainer_callback import ProgressCallback
@@ -41,19 +42,6 @@ PROMPT = (
     "### Instruction:\n{instruction}\n\n### Response:"
 )
 
-def find_all_linear_names(model) -> List[str]:
-    """
-    Finds all linear layer names in a model, excluding the lm_head.
-    This is a robust way to automatically select target_modules for LoRA.
-    """
-    linear_layer_names = []
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear):
-            # Exclude the output layer and embeddings from LoRA training
-            if "lm_head" not in name and "embed_tokens" not in name:
-                linear_layer_names.append(name)
-    print(f"✅ Automatically discovered {len(linear_layer_names)} linear layers to target.")
-    return linear_layer_names
 
 def get_nb_trainable_parameters(model) -> tuple[int, int]:
     r"""
@@ -150,37 +138,6 @@ class TrainingArguments(transformers.TrainingArguments):
         default="no",
         metadata={"help": "no"},
     )
-def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
-    """Collects the state dict and dump to disk."""
-    state_dict = trainer.model.state_dict()
-    if trainer.args.should_save:
-        cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
-        del state_dict
-        trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
-
-
-def smart_tokenizer_and_embedding_resize(
-    special_tokens_dict: dict,
-    tokenizer: transformers.PreTrainedTokenizer,
-    model: transformers.PreTrainedModel,
-):
-    """Resize tokenizer and embedding.
-
-    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
-    """
-    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
-    model.resize_token_embeddings(len(tokenizer))
-
-    if num_new_tokens > 0:
-        input_embeddings = model.get_input_embeddings().weight.data
-        output_embeddings = model.get_output_embeddings().weight.data
-
-        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
-        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
-
-        input_embeddings[-num_new_tokens:] = input_embeddings_avg
-        output_embeddings[-num_new_tokens:] = output_embeddings_avg
-
 
 def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> dict:
     """Tokenize a list of strings."""
@@ -258,49 +215,31 @@ def load_or_quantize_model(
     os.makedirs(cache_dir, exist_ok=True)
 
     if is_model_object:
-        key = cache_key or "in_memory_model"
-        quantized_model_path = os.path.join(cache_dir, f"{key}_gptq_{bits}bit_groupsize_{qalora_group_size}")
-        if os.path.exists(os.path.join(quantized_model_path, "config.json")):
-            print(f"Cache hit: {quantized_model_path}")
-            return AutoModelForCausalLM.from_pretrained(
-                quantized_model_path, device_map="auto", torch_dtype=torch.float16, trust_remote_code=True
-            )
-        raise ValueError("Quantizing an in-memory model is not implemented here. Pass a model name/path string.")
+        raise ValueError("load_or_quantize_model expects a path, not a model object")
 
     base_model = model_or_path
-    model_id = base_model.replace("/", "_").replace("\\", "_")
-    quantized_model_path = os.path.join(cache_dir, f"{model_id}_gptq_{bits}bit_groupsize_{qalora_group_size}_calibration_dataset_{calibration_dataset}")
-
-
-    # quantized_model_bad = AutoModelForCausalLM.from_pretrained(
-    #     quantized_model_path + "_bad", device_map="auto", torch_dtype=torch.float16, trust_remote_code=True
-    # )
-    # quantized_model_good = AutoModelForCausalLM.from_pretrained(
-    #     quantized_model_path + "_good", device_map="auto", torch_dtype=torch.float16, trust_remote_code=True
-    # )
-    # layer_name = "model.layers.0.self_attn.k_proj"
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     "HuggingFaceTB/SmolLM2-1.7B", device_map="auto", torch_dtype=torch.float16, trust_remote_code=True
-    # )
     
-    # layer = model
-    # layer_good = quantized_model_bad
-    # layer_bad = quantized_model_good
-    # for part in layer_name.split('.'):
-    #     layer = getattr(layer, part)
-    #     layer_good = getattr(layer_good, part) 
-    #     layer_bad = getattr(layer_bad, part)
-
-    # error = layer.weight - layer_good.dequantize_weight()
-    # error2 = layer.weight - layer_bad.dequantize_weight()
-    # print(sum(sum(error, error2)))
-
-    if os.path.exists(os.path.join(quantized_model_path, "config.json")):
-        print(f"Cache hit: {quantized_model_path}")
-        return AutoModelForCausalLM.from_pretrained(
-            quantized_model_path, device_map="auto", torch_dtype=torch.float16, trust_remote_code=True
+    # ✅ Use custom cache_key if provided, otherwise auto-generate
+    if cache_key:
+        quantized_model_path = os.path.join(cache_dir, cache_key)
+    else:
+        model_id = base_model.replace("/", "_").replace("\\", "_")
+        quantized_model_path = os.path.join(
+            cache_dir, 
+            f"{model_id}_gptq_{bits}bit_groupsize_{qalora_group_size}_calibration_dataset_{calibration_dataset}"
         )
 
+    # Check if already quantized
+    if os.path.exists(os.path.join(quantized_model_path, "config.json")):
+        print(f"✅ Loading cached GPTQ model from {quantized_model_path}")
+        return AutoModelForCausalLM.from_pretrained(
+            quantized_model_path, 
+            device_map="auto", 
+            torch_dtype=torch.float16, 
+            trust_remote_code=True
+        )
+
+    # Quantize and save
     print(f"Quantizing base model {base_model} with {bits}-bit, group_size={qalora_group_size}")
     gptq_config = GPTQConfig(
         bits=bits,
@@ -309,11 +248,14 @@ def load_or_quantize_model(
         group_size=qalora_group_size,
         desc_act=False,
         sym=False,
-        backend="auto_trainable",
-        quant_engine="spqr"
+        backend="auto_trainable",  # ✅ ADD THIS
     )
     model = AutoModelForCausalLM.from_pretrained(
-        base_model, device_map="auto", quantization_config=gptq_config, torch_dtype=torch.float16, trust_remote_code=True
+        base_model, 
+        device_map="auto", 
+        quantization_config=gptq_config, 
+        torch_dtype=torch.float16, 
+        trust_remote_code=True
     )
     model.save_pretrained(quantized_model_path)
     tokenizer.save_pretrained(quantized_model_path)
@@ -396,103 +338,6 @@ def compare_models(model1, model2, model1_name="Model 1", model2_name="Model 2",
         return False
 
 
-def ensure_gptq_artifact(model_path, model_to_quantize, calibration_set, tokenizer, bits, group_size):
-    """
-    Ensure a GPTQ-quantized artifact exists at `model_path`. If it doesn't, quantize
-    the model found at `model_to_quantize` and save it to `model_path`.
-
-    Args:
-        model_path: Target directory for the quantized artifact.
-        model_to_quantize: Source model (usually a directory) to quantize.
-        tokenizer: Tokenizer to save alongside the model.
-        bits: Quantization bit width.
-        group_size: Group size for GPTQ.
-
-    Returns:
-        None. Writes artifacts to disk.
-    """
-    if os.path.exists(model_path) and os.path.exists(os.path.join(model_path, "config.json")):
-        print(f"Cache hit: {model_path} – skip quantization")
-        return
-
-    os.makedirs(model_path, exist_ok=True)
-    print(f"Quantizing {model_to_quantize} -> {model_path} with {bits}-bit, group_size={group_size}")
-    gptq_cfg = GPTQConfig(
-        bits=bits,
-        # dataset="alpaca-cleaned",
-        dataset=calibration_set,
-        tokenizer=tokenizer,
-        group_size=group_size,
-        desc_act=False,
-        sym=False,
-        # backend="auto_trainable",
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_to_quantize,
-        device_map="auto",
-        torch_dtype=torch.float16,
-        quantization_config=gptq_cfg,
-        trust_remote_code=True,
-    )
-    model.save_pretrained(model_path)
-    tokenizer.save_pretrained(model_path)
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    print(f"✅ Saved quantized artifact to {model_path}")
-
-
-def load_residual_with_adapter(
-    residual_or_quantized_path: str,
-    adapter_path: str,
-    *,
-    is_trainable: bool = False,
-    device_map: str = "auto",
-    dtype: torch.dtype = torch.float16,
-):
-    """
-    Load a residual (FP) or GPTQ-quantized residual model and attach the matching LoRA adapter.
-    """
-    tok = transformers.AutoTokenizer.from_pretrained(
-        residual_or_quantized_path, use_fast=True, padding_side="right", trust_remote_code=True
-    )
-    base = AutoModelForCausalLM.from_pretrained(
-        residual_or_quantized_path, device_map=device_map, torch_dtype=dtype, trust_remote_code=True
-    )
-    model = PeftModel.from_pretrained(base, adapter_path, is_trainable=is_trainable)
-    if is_trainable:
-        # ✅ CRITICAL: Set model to training mode
-        model.train()
-        
-        # ✅ Enable gradient checkpointing if available
-        if hasattr(model, 'gradient_checkpointing_enable'):
-            model.gradient_checkpointing_enable()
-        
-        # ✅ CRITICAL: Enable input gradients for PEFT + gradient checkpointing
-        if hasattr(model, 'enable_input_require_grads'):
-            model.enable_input_require_grads()
-            
-        # ✅ Disable cache during training (required for gradient computation)
-        model.config.use_cache = False
-        
-        # ✅ Verify trainable parameters
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in model.parameters())
-        print(f"Trainable parameters: {trainable_params:,}")
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable %: {100 * trainable_params / total_params:.2f}%")
-        
-        # ✅ Debug: Verify adapter parameters are trainable
-        adapter_params = [name for name, param in model.named_parameters() if param.requires_grad]
-        if adapter_params:
-            print(f"✅ Found {len(adapter_params)} trainable adapter parameters")
-        else:
-            print("❌ NO TRAINABLE PARAMETERS FOUND!")
-            
-    else:
-        model.eval()
-    return model, tok
-
 def train():
     parser = transformers.HfArgumentParser(TrainingArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
@@ -500,6 +345,10 @@ def train():
 
     os.makedirs(script_args.output_dir, exist_ok=True)
     config_path = os.path.join(script_args.output_dir, "run_config.json")
+
+    # TODO: adapt the run_parameter count in here:
+    
+    
     with open(config_path, 'w') as f:
         json.dump(asdict(script_args), f, indent=4)
     print(f"✅ Run-Konfiguration gespeichert in: {config_path}")
@@ -923,23 +772,25 @@ def train():
         )
         quantized_path = os.path.join(base_output_dir, quantized_name)
 
-        ensure_gptq_artifact(
-            quantized_path,
+        model = load_or_quantize_model(
             full_precision_residual_path,
-            calibration_dataset,
-            tokenizer=tokenizer,
+            tokenizer,
+            qalora_group_size=group_size,
             bits=bits,
-            group_size=group_size,
+            cache_dir=os.path.dirname(quantized_path),  # Use the directory from quantized_path
+            cache_key=os.path.basename(quantized_path),  # Use the filename as cache key
+            calibration_dataset=calibration_dataset,
         )
 
-        print(f"✅ Residual quantized (or loaded from cache): {quantized_path}")
+        # Attach LoRA adapter
+        model = PeftModel.from_pretrained(model, adapter_path, is_trainable=True)
+        model.train()
+        if hasattr(model, 'enable_input_require_grads'):
+            model.enable_input_require_grads()
+        model.config.use_cache = False
 
-        model, tok = load_residual_with_adapter(
-            residual_or_quantized_path=quantized_path,
-            adapter_path=adapter_path,
-            is_trainable=True,
-            dtype=torch.float16,
-        )
+        print(f"✅ Residual quantized (or loaded from cache) and adapter attached: {adapter_path}")
+
         print(f"\n{'=' * 60}")
         print("🎉 QUANTIZATION SUMMARY")
         print(f"{'=' * 60}")
