@@ -12,7 +12,7 @@ set -e
 # CONFIGURATION
 # ============================================================================
 MODEL_NAMES=(
-    "HuggingFaceTB/SmolLM2-1.7B"
+    # "HuggingFaceTB/SmolLM2-1.7B"
     "TinyLlama/TinyLlama_v1.1"
     # "meta-llama/Llama-3.2-1B"
     # "microsoft/phi-2"
@@ -33,8 +33,9 @@ export BASE_OUTPUT_DIR
 echo "BASE_OUTPUT_DIR=$BASE_OUTPUT_DIR"
 # --- Iteration Parameters ---
 # TRAINING_MODES=("qalora" "pissa_rank_analysis" "qalora_svd_error_two_adapter") 
-TRAINING_MODES=("qalora" "qalora_svd_error" "qalora_svd_error_two_adapter") 
-LORA_RANKS=(8 16 32 64 128)
+TRAINING_MODES=("qalora" "qalora_svd_error" "pissa_rank_analysis") 
+# LORA_RANKS=(8 16 32 64 128)
+LORA_RANKS=(4 8 16 32 64)
 BITS_LIST=(2)
 CALIBRATION_DATASETS=("c4")
 QALORA_GROUP_SIZES=(32)
@@ -69,7 +70,7 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-export WANDB_PROJECT="qalora-finetuning-thesis"
+export WANDB_PROJECT="qalora-finetuning-thesis-tiny-llama"
 
 # ============================================================================
 # Main Execution
