@@ -12,8 +12,9 @@ set -e
 # CONFIGURATION
 # ============================================================================
 MODEL_NAMES=(
-    # "HuggingFaceTB/SmolLM2-1.7B"
-    "TinyLlama/TinyLlama_v1.1"
+    "HuggingFaceTB/SmolLM2-1.7B"
+    # "HuggingFaceTB/SmolLM-1.7B"
+    # "TinyLlama/TinyLlama_v1.1"
     # "meta-llama/Llama-3.2-1B"
     # "microsoft/phi-2"
 )
@@ -38,11 +39,12 @@ TRAINING_MODES=("qalora" "qalora_svd_error" "pissa_rank_analysis")
 LORA_RANKS=(4 8 16 32 64)
 BITS_LIST=(2)
 CALIBRATION_DATASETS=("c4")
-QALORA_GROUP_SIZES=(32)
+QALORA_GROUP_SIZES=(16)
 
 # --- Training Configuration ---
 DATA_PATH="yahma/alpaca-cleaned"
-DATASET_SPLIT="train[:5000]"
+DATASET_SPLIT="train[:15000]"
+DATASET_VAL_SPLIT="train[15000:16000]"
 NUM_TRAIN_EPOCHS=2
 PER_DEVICE_TRAIN_BATCH_SIZE=4
 LEARNING_RATE=1e-4
@@ -54,7 +56,7 @@ SAVE_STEPS=5000
 BF16="True"
 
 # --- Mode-Specific Parameters ---
-PISSA_NITER=4
+# PISSA_NITER=4
 
 # ============================================================================
 # Helper Functions
@@ -70,7 +72,7 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-export WANDB_PROJECT="qalora-finetuning-thesis-tiny-llama"
+export WANDB_PROJECT="qalora-finetuning-smollm2-groupsize-with-evaluation"
 
 # ============================================================================
 # Main Execution
@@ -111,10 +113,10 @@ main() {
                                 --output_dir="$TRAIN_OUTPUT_DIR" \
                                 --data_path="$DATA_PATH" \
                                 --dataset_split="$DATASET_SPLIT" \
+                                --dataset_split_validation="$DATASET_VAL_SPLIT" \
                                 --dataset_field "instruction" "output" \
                                 --lora_r="$rank" \
                                 --qalora_group_size="$group_size" \
-                                --pissa_niter="$PISSA_NITER" \
                                 --bits="$bits" \
                                 --calibration_dataset="$dataset" \
                                 --num_train_epochs="$NUM_TRAIN_EPOCHS" \
@@ -126,6 +128,7 @@ main() {
                                 --logging_steps="$LOGGING_STEPS" \
                                 --save_steps="$SAVE_STEPS" \
                                 --model_max_length="$MAX_LENGTH" \
+                                --eval_steps=500 \
 
                             if [ $? -ne 0 ]; then
                                 log_error "Training failed for $EXPERIMENT_NAME. Skipping."

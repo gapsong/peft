@@ -464,15 +464,11 @@ class LoraLayer(BaseTunerLayer):
         Initialisiert LoRA-Adapter A und B via "SVD Pooled Aware"-Methode.
         Die SVD wird auf einer strukturell gepoolten Version der Gewichtsmatrix durchgeführt.
         """
-        # 1. Leite die wahren Dimensionen aus den LoRA-Layern ab
         out_features = self.lora_B[adapter_name].weight.shape[0]
         in_features = self.lora_A[adapter_name].weight.shape[1]
         rank = self.r[adapter_name]
-        group_size = 32  # Deine definierte Gruppengröße für das Pooling
-
-        # 2. Hole die Gewichte und prüfe die Form
+        group_size = self.kwargs["qalora_group_size"]
         weight = self.get_base_layer().weight.clone().to(torch.float32)
-        
         needs_transpose = False
         if weight.shape == (out_features, in_features):
             print("✅ Dimensionen stimmen - kein Transpose nötig")
@@ -677,26 +673,26 @@ class LoraLayer(BaseTunerLayer):
         if Wq.shape != Worig.shape:
             raise ValueError(f"[error-svd] Shape-Mismatch: W_orig {tuple(Worig.shape)} vs W_q {tuple(Wq.shape)}")
 
-        if Wq.shape[0] == Wq.shape[1]:
-            Wq = Wq.t()
+        # if Wq.shape[0] == Wq.shape[1]:
+        #     Wq = Wq.t()
         
         # E = W_orig - W_q
         E = (Worig - Wq).to(torch.float32)
-        E_corrected = E @ init_lora_weights.get("hessian_inverse_layer", {}).to(E.device, dtype=E.dtype)
+        # E_corrected = E @ init_lora_weights.get("hessian_inverse_layer", {}).to(E.device, dtype=E.dtype)
 
         # SVD(E_corrected)
-        U, S, Vh = torch.linalg.svd(E_corrected, full_matrices=False)
-        r_eff = min(r, U.shape[1], Vh.shape[0])
-        Ur, Sr, Vh_r = U[:, :r_eff], S[:r_eff], Vh[:r_eff, :]
+        # U, S, Vh = torch.linalg.svd(E_corrected, full_matrices=False)
+        # r_eff = min(r, U.shape[1], Vh.shape[0])
+        # Ur, Sr, Vh_r = U[:, :r_eff], S[:r_eff], Vh[:r_eff, :]
 
-        # Split singular values into A/B
-        Sr_scaled = (Sr / max(s, 1e-12)).clamp_min(1e-12)
-        sqrtS = torch.sqrt(Sr_scaled)
-        B_svd_corrected = Ur @ torch.diag(sqrtS)
-        A_svd = torch.diag(sqrtS) @ Vh_r
+        # # Split singular values into A/B
+        # Sr_scaled = (Sr / max(s, 1e-12)).clamp_min(1e-12)
+        # sqrtS = torch.sqrt(Sr_scaled)
+        # B_svd_corrected = Ur @ torch.diag(sqrtS)
+        # A_svd = torch.diag(sqrtS) @ Vh_r
 
-        # Adjust for QA-LoRA scaling factor g
-        A_store_svd_corrected = A_svd
+        # # Adjust for QA-LoRA scaling factor g
+        # A_store_svd_corrected = A_svd
 
         # SVD(E)
         U, S, Vh = torch.linalg.svd(E, full_matrices=True)

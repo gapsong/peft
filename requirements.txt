@@ -20,3 +20,4 @@ wandb
 lm_eval
 datasets
 alpaca_eval
+git+https://github.com/felipemaiapolo/tinyBenchmarks

@@ -29,6 +29,7 @@ from transformers import AutoModelForCausalLM, GPTQConfig, Trainer
 from transformers.trainer_callback import ProgressCallback
 from peft import LoraConfig, PeftModel, get_peft_model
 import datasets
+import utils
 
 is_training_on_cluster = os.environ.get("TRAIN_MODE", "").lower() == "cluster"
 if is_training_on_cluster:
@@ -74,8 +75,10 @@ class TrainingArguments(transformers.TrainingArguments):
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
     dataset_split: str = field(default="train[:100000]", metadata={"help": "(['train', 'test', 'eval']):"})
+    dataset_split_validation: str = field(default="train[:100000]", metadata={"help": "(['train', 'test', 'eval']):"})
     dataset_field: list[str] = field(default=None, metadata={"help": "Fields of dataset input and output."})
     dataloader_num_proc: int = field(default=16, metadata={"help": "Number of processes to load dataset"})
+    eval_steps: int = field(default=500, metadata={"help": "Number running eval"})
     bits: int = field(default=4, metadata={"help": "Number of bits to quantize the model. Default is 4."})
     adapter_path: str = field(
         default=None,
@@ -798,6 +801,25 @@ def train():
         print(f"LoRA rank: {script_args.lora_r}")
         print(f"Adapter saved to: {adapter_path}")
 
+    elif script_args.training_mode == "lora":
+        print("full finetuning")
+        model = AutoModelForCausalLM.from_pretrained(
+                script_args.model_name_or_path,
+                device_map="auto",
+                torch_dtype=torch.float16,
+        )
+
+        lora_config = LoraConfig(
+            task_type="CAUSAL_LM",
+            r=script_args.lora_r,
+            lora_alpha=script_args.lora_r,
+            target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
+            lora_dropout=0,
+            bias="none",
+        )
+
+        peft_model = get_peft_model(model, lora_config)
+        
     trainable_params, all_param = get_nb_trainable_parameters(model)
     print(
         f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param:.2f}%"
@@ -818,12 +840,30 @@ def train():
             "response": script_args.dataset_field[1],
         },
     )
+    raw_validation_datasets = load_dataset(script_args.data_path, split=script_args.dataset_split_validation)
+    eval_dataset = raw_validation_datasets.map(
+        train_tokenize_function,
+        batched=True,
+        batch_size=script_args.dataloader_batch_size,
+        num_proc=script_args.dataloader_num_proc,
+        remove_columns=raw_train_datasets.column_names,
+        load_from_cache_file=True,
+        desc="Running tokenizer on train dataset",
+        fn_kwargs={
+            "tokenizer": tokenizer,
+            "query": script_args.dataset_field[0],
+            "response": script_args.dataset_field[1],
+        },
+    )
 
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+
     data_module = {
         "train_dataset": train_dataset,
+        "eval_dataset": eval_dataset,
         "data_collator": data_collator,
     }
+    results_params = utils.main(model, script_args.lora_r, script_args.qalora_group_size, "float16") 
 
     import wandb
     wandb.init()
@@ -844,8 +884,8 @@ def train():
         from eval_peft import run_lm_harness_and_print_results
         from transformers import TrainerCallback
 
-        def run_my_eval(model, tokenizer, evaluation_dir, eval_step):
-            tasks = "wikitext,piqa"
+        def run_lm_harness_eval(model, tokenizer, evaluation_dir, eval_step):
+            tasks = "wikitext,mathqa,tinyMMLU"
             harness_file_name = f"lm_harness_results_step_{eval_step}"
             run_lm_harness_and_print_results(
                 model=model,
@@ -858,6 +898,7 @@ def train():
                 file_name=harness_file_name,
             )
             print(f"✅ LM-Harness Ergebnisse gespeichert in: {evaluation_dir}/{harness_file_name}")
+            eval_metrics = trainer.evaluate()
 
         class CustomEvalCallback(TrainerCallback):
             def __init__(self, eval_fn, eval_args, eval_every_steps=250):
@@ -877,12 +918,14 @@ def train():
         os.makedirs(evaluation_dir, exist_ok=True)
 
         custom_eval_callback = CustomEvalCallback(
-            eval_fn=run_my_eval,
+            eval_fn=run_lm_harness_eval,
             eval_args={"model": model, "tokenizer": tokenizer, "evaluation_dir": evaluation_dir},
-            eval_every_steps=500
+            eval_every_steps=script_args.eval_steps
         )
 
         trainer.add_callback(custom_eval_callback)
+        init_metrics = trainer.evaluate()
+        print(f"initial eval_loss={init_metrics.get('eval_loss')}")
         trainer.train()
         
         end_time = time.time()
@@ -944,7 +987,7 @@ def train():
 
         from eval_peft import run_lm_harness_and_print_results
         # tasks = "wikitext,piqa,tinyArc,tinyHellaswag,tinyGSM8k,tinyMMLU"
-        tasks = "wikitext, piqa"
+        tasks = "wikitext,mathqa,tinyMMLU"
         harness_file_name = "lm_harness_results"
         run_lm_harness_and_print_results(
             model=model,
@@ -952,7 +995,7 @@ def train():
             tasks=tasks,
             num_fewshot=1,
             limit=EVAL_SAMPLES,
-            per_device_eval_batch_size=1,
+            per_device_eval_batch_size=2,
             output_dir=evaluation_dir,
             file_name=harness_file_name,
         )

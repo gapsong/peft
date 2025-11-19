@@ -127,10 +127,14 @@ def evaluate_with_lm_eval(model, tokenizer, tasks, num_fewshot=5, limit=None, pe
         limit=limit,
         batch_size=per_device_eval_batch_size,
     )
-    # wandb_logger = WandbLogger()  # or empty if wandb.init(...) already called before
-    # wandb_logger.post_init(results)
-    # wandb_logger.log_eval_result()
-    # wandb_logger.log_eval_samples(results["samples"])  # if log_samples
+
+    try:
+        wandb_logger = WandbLogger()
+        wandb_logger.post_init(results)
+        wandb_logger.log_eval_result()
+        wandb_logger.log_eval_samples(results["samples"])  # if log_samples
+    except ValueError:
+        print("logging not possible")
     
     # Clean up
     del lm_harness_model
@@ -208,10 +212,10 @@ def generate_alpaca_response(model, tokenizer, training_mode, lora_r, output_dir
     print(f"Proceeding with {len(eval_subset)} samples for generation.")
 
     outputs = []
-    total_to_generate = 10
+    # total_to_generate = 10
 
     for i, example in enumerate(eval_subset):
-        print(f"Generating for example {i + 1}/{total_to_generate}...")
+        print(f"Generating for example {i + 1}")
 
         output = generate_response(model, tokenizer, example["instruction"])
         outputs.append({
@@ -219,8 +223,8 @@ def generate_alpaca_response(model, tokenizer, training_mode, lora_r, output_dir
             "output": output,
             "generator": f"{training_mode}_r{lora_r}",
         })
-        if i == total_to_generate:
-            break
+        # if i == total_to_generate:
+        #     break
     # --- END OF CHANGE ---
 
     # Save the results to a JSON file

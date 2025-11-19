@@ -72,11 +72,11 @@ def get_num_params(param):  # from PEFT
     return num_params
 
 
-def get_param_count(model_id, rank, group_size):
+def get_param_count(model, rank, group_size):
     """Get the number of parameters in a model, including LoRA parameters"""
     # this is only an approximation because we ignore buffers
-    model = create_empty_model(model_id, "transformers")
-
+    # model = create_empty_model(model_id, "transformers")
+    model = create_empty_model("TinyLlama/TinyLlama_v1.1", "transformers")
     count_params = defaultdict(int)
     for module in model.modules():
         if len(list(module.children())) > 0:
@@ -110,7 +110,7 @@ def get_param_bytes(count_params, dtype):
             num_bytes[key] = int(val * dtype_to_bytes_other["float32"])
         elif key == QALORA:
             # we assume that QALORA is always loaded in bfloat16
-            num_bytes[key] = int(val * dtype_to_bytes_other["bfloat16"])
+            num_bytes[key] = int(val * dtype_to_bytes_other["float16"])
         else:
             num_bytes[key] = int(val * dtype_to_bytes_other[dtype])
     num_bytes = dict(num_bytes)
@@ -148,7 +148,7 @@ def get_training_memory_estimate(num_bytes):
     return estimates
 
 
-def main(model_id, rank, group_size, dtype, sink=print):
+def main(model, rank, group_size, dtype, sink=print):
     """Main function to calculate memory requirements of a model.
 
     Outputs the results in JSON format.
@@ -159,7 +159,7 @@ def main(model_id, rank, group_size, dtype, sink=print):
         dtype (str): Data type, one of float32, float16, bfloat16, int8, int4
         sink (function): Function to print the result with (default: print).
     """
-    count_params = get_param_count(model_id, rank=rank, group_size=group_size)
+    count_params = get_param_count(model, rank=rank, group_size=group_size)
     num_bytes = get_param_bytes(count_params, dtype=dtype)
     num_bytes_readable = {k: convert_bytes(v) for k, v in num_bytes.items()}
 
