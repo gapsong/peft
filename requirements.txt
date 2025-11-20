@@ -10,7 +10,6 @@ packaging
 pytest
 numpy
 pyyaml
-datasets
 psutil
 setuptools
 pandas
@@ -18,6 +17,6 @@ seaborn
 matplotlib
 wandb
 lm_eval
-datasets
+datasets==4.0.0
 alpaca_eval
 git+https://github.com/felipemaiapolo/tinyBenchmarks

@@ -157,83 +157,53 @@ def print_results(results):
             if isinstance(value, (int, float)):
                 print(f"  {metric_name}: {value:.4f}")
 
-def generate_response(model, tokenizer, instruction: str, max_new_tokens: int = 256) -> str:
-    """
-    Generates a response from the model given an instruction.
-    """
-    # Format the instruction using the same prompt template as in training
-    PROMPT = (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response:"
-    )
-    prompt = PROMPT.format_map({"instruction": instruction})
+import os, json, torch, datasets
+from tqdm import tqdm
 
-    # Tokenize the formatted prompt
-    inputs = tokenizer(prompt, return_tensors="pt")
-    input_ids = inputs.input_ids.to(model.device)
+def generate_alpaca_response(model, tokenizer, training_mode, lora_r, output_dir, file_name, batch_size=8):
+    # 1. Setup correct padding
+    tokenizer.padding_side = "left"
+    if not tokenizer.pad_token: tokenizer.pad_token = tokenizer.eos_token
 
-    # Generate text using the model
-    with torch.no_grad():
-        generation_output = model.generate(
-            input_ids=input_ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            top_k=50,
-            top_p=0.95,
-            temperature=0.7,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+    # 2. Load and unique-ify data
+    ds = datasets.load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval")["eval"]
+    data = ds.to_pandas().drop_duplicates(subset=['instruction']).to_dict('records')
+    print(f"Generating {len(data)} samples in batches of {batch_size}...")
 
-    # Decode the generated tokens, skipping special tokens
-    # The output contains the prompt, so we slice it off
-    response = tokenizer.decode(generation_output[0][len(input_ids[0]):], skip_special_tokens=True)
-    return response.strip()
+    # 3. Pre-format prompts
+    PROMPT = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:\n"
+    prompts = [PROMPT.format(instruction=d["instruction"]) for d in data]
+    results = []
 
-import datasets
-import json
-import pandas as pd
+    # 4. Batched Generation
+    for i in tqdm(range(0, len(prompts), batch_size)):
+        batch_prompts = prompts[i : i + batch_size]
+        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
+        
+        with torch.no_grad():
+            # Generate
+            outputs = model.generate(
+                **inputs, max_new_tokens=512, do_sample=True, top_p=0.95, temperature=0.7, pad_token_id=tokenizer.pad_token_id
+            )
+        
+        # Decode only new tokens (skipping input prompt)
+        dataset_start_idx = inputs.input_ids.shape[1]
+        decoded = tokenizer.batch_decode(outputs[:, dataset_start_idx:], skip_special_tokens=True)
+        del outputs, inputs
+        torch.cuda.empty_cache()
+        # Attach results to original data
+        for j, text in enumerate(decoded):
+            results.append({
+                **data[i+j], 
+                "output": text.strip(), 
+                "generator": f"{training_mode}_r{lora_r}"
+            })
 
-def generate_alpaca_response(model, tokenizer, training_mode, lora_r, output_dir, file_name):
-    eval_set = datasets.load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval")["eval"]
-
-    # --- START OF CHANGE ---
-    # Prepare a unique subset of the evaluation data
-    # max_eval_samples = 10
-    # print(f"Filtering evaluation set to {max_eval_samples} unique instructions...")
-    df = eval_set.to_pandas()
-    unique_df = df.drop_duplicates(subset=['instruction'])
-
-    # # If there are more unique instructions than requested, sample them to avoid bias
-    # if len(unique_df) > max_eval_samples:
-    #     unique_df = unique_df.sample(n=max_eval_samples, random_state=script_args.seed)
-
-    eval_subset = datasets.Dataset.from_pandas(unique_df)
-    print(f"Proceeding with {len(eval_subset)} samples for generation.")
-
-    outputs = []
-    # total_to_generate = 10
-
-    for i, example in enumerate(eval_subset):
-        print(f"Generating for example {i + 1}")
-
-        output = generate_response(model, tokenizer, example["instruction"])
-        outputs.append({
-            **example,
-            "output": output,
-            "generator": f"{training_mode}_r{lora_r}",
-        })
-        # if i == total_to_generate:
-        #     break
-    # --- END OF CHANGE ---
-
-    # Save the results to a JSON file
-    output_eval_file = os.path.join(output_dir, f"{file_name}_alpaca_eval_results.json")
-    with open(output_eval_file, "w") as f:
-        json.dump(outputs, f, indent=4)
-
-    print(f"\n✅ Alpaca evaluation finished. Results saved to {output_eval_file}")
-    # --- END: Generation and Evaluation Logic ---
+    # 5. Save
+    out_path = os.path.join(output_dir, f"{file_name}_alpaca_eval_results.json")
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=4)
+    print(f"✅ Saved to {out_path}")
 
 
 def run_lm_harness_and_print_results(

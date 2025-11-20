@@ -40,7 +40,7 @@ IGNORE_INDEX = -100
 PROMPT = (
     "Below is an instruction that describes a task. "
     "Write a response that appropriately completes the request.\n\n"
-    "### Instruction:\n{instruction}\n\n### Response:"
+    "### Instruction:\n{instruction}\n\n### Response:\n"
 )
 
 
@@ -155,8 +155,11 @@ def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedToken
         for text in strings
     ]
     input_ids = labels = [tokenized.input_ids[0] for tokenized in tokenized_list]
+    # input_ids_lens = labels_lens = [
+    #     tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
+    # ]
     input_ids_lens = labels_lens = [
-        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
+        tokenized.attention_mask[0].sum().item() for tokenized in tokenized_list
     ]
     return {
         "input_ids": input_ids,
@@ -184,6 +187,30 @@ def preprocess(
     }
 
 
+# @dataclass
+# class DataCollatorForSupervisedDataset:
+#     """Collate examples for supervised fine-tuning."""
+
+#     tokenizer: transformers.PreTrainedTokenizer
+
+#     def __call__(self, instances: Sequence[dict]) -> dict[str, torch.Tensor]:
+#         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        
+#         # Ensure they are detached tensors before padding to avoid graph errors
+#         input_ids = [torch.tensor(x).clone().detach() if isinstance(x, list) else x.clone().detach() for x in input_ids]
+#         labels = [torch.tensor(x).clone().detach() if isinstance(x, list) else x.clone().detach() for x in labels]
+        
+#         input_ids = torch.nn.utils.rnn.pad_sequence(
+#             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+#         )
+#         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        
+#         return {
+#             "input_ids": input_ids,
+#             "labels": labels,
+#             "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
+#         }
+ 
 @dataclass
 class DataCollatorForSupervisedDataset:
     """Collate examples for supervised fine-tuning."""
@@ -191,17 +218,29 @@ class DataCollatorForSupervisedDataset:
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[dict]) -> dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
-        input_ids = [torch.tensor(x) for x in input_ids]
+        input_ids_list = [torch.tensor(instance["input_ids"]) for instance in instances]
+        labels_list = [torch.tensor(instance["labels"]) for instance in instances]
+        
+        # 2. Create Attention Masks explicitly BEFORE padding
+        # This ensures the EOS token (which is at the end of input_ids) gets a '1'
+        attention_mask_list = [torch.ones_like(ids) for ids in input_ids_list]
+        
+        # 3. Pad everything
         input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+            input_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
-        labels = [torch.tensor(x) for x in labels]
-        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        labels = torch.nn.utils.rnn.pad_sequence(
+            labels_list, batch_first=True, padding_value=IGNORE_INDEX
+        )
+        # Pad the mask with 0
+        attention_mask = torch.nn.utils.rnn.pad_sequence(
+            attention_mask_list, batch_first=True, padding_value=0
+        )
+
         return {
             "input_ids": input_ids,
             "labels": labels,
-            "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
+            "attention_mask": attention_mask,
         }
 
 
@@ -807,6 +846,7 @@ def train():
                 script_args.model_name_or_path,
                 device_map="auto",
                 torch_dtype=torch.float16,
+                attn_implementation="sdpa"
         )
 
         lora_config = LoraConfig(
@@ -824,7 +864,7 @@ def train():
     print(
         f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param:.2f}%"
     )
-
+    
     raw_train_datasets = load_dataset(script_args.data_path, split=script_args.dataset_split)
     train_dataset = raw_train_datasets.map(
         train_tokenize_function,
@@ -989,16 +1029,16 @@ def train():
         # tasks = "wikitext,piqa,tinyArc,tinyHellaswag,tinyGSM8k,tinyMMLU"
         tasks = "wikitext,mathqa,tinyMMLU"
         harness_file_name = "lm_harness_results"
-        run_lm_harness_and_print_results(
-            model=model,
-            tokenizer=tokenizer,
-            tasks=tasks,
-            num_fewshot=1,
-            limit=EVAL_SAMPLES,
-            per_device_eval_batch_size=2,
-            output_dir=evaluation_dir,
-            file_name=harness_file_name,
-        )
+        # run_lm_harness_and_print_results(
+        #     model=model,
+        #     tokenizer=tokenizer,
+        #     tasks=tasks,
+        #     num_fewshot=1,
+        #     limit=EVAL_SAMPLES,
+        #     per_device_eval_batch_size=2,
+        #     output_dir=evaluation_dir,
+        #     file_name=harness_file_name,
+        # )
         
         # model = model.merge_and_unload()
         
@@ -1014,10 +1054,10 @@ def train():
         # )
         # print(f"✅ LM-Harness Ergebnisse gespeichert in: {evaluation_dir}")
 
-        # from eval_peft import generate_alpaca_response
-        # alpaca_file_name = "alpaca_eval_results"
-        # generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name)
-        # print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
+        from eval_peft import generate_alpaca_response
+        alpaca_file_name = "alpaca_eval_results"
+        generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name, 32)
+        print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
 
         metrics_path = os.path.join(evaluation_dir, "training_metrics.json")
         with open(metrics_path, 'w') as f:
