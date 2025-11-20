@@ -34,7 +34,7 @@ export BASE_OUTPUT_DIR
 echo "BASE_OUTPUT_DIR=$BASE_OUTPUT_DIR"
 # --- Iteration Parameters ---
 # TRAINING_MODES=("qalora" "pissa_rank_analysis" "qalora_svd_error_two_adapter") 
-TRAINING_MODES=("qalora" "qalora_svd_error" "pissa_rank_analysis") 
+TRAINING_MODES=("lora" "qalora" "qalora_svd_error" "pissa_rank_analysis") 
 # LORA_RANKS=(8 16 32 64 128)
 LORA_RANKS=(4 8 16 32 64)
 BITS_LIST=(2)
