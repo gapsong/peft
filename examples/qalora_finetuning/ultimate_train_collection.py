@@ -1029,16 +1029,16 @@ def train():
         # tasks = "wikitext,piqa,tinyArc,tinyHellaswag,tinyGSM8k,tinyMMLU"
         tasks = "wikitext,mathqa,tinyMMLU"
         harness_file_name = "lm_harness_results"
-        # run_lm_harness_and_print_results(
-        #     model=model,
-        #     tokenizer=tokenizer,
-        #     tasks=tasks,
-        #     num_fewshot=1,
-        #     limit=EVAL_SAMPLES,
-        #     per_device_eval_batch_size=2,
-        #     output_dir=evaluation_dir,
-        #     file_name=harness_file_name,
-        # )
+        run_lm_harness_and_print_results(
+            model=model,
+            tokenizer=tokenizer,
+            tasks=tasks,
+            num_fewshot=1,
+            limit=EVAL_SAMPLES,
+            per_device_eval_batch_size=2,
+            output_dir=evaluation_dir,
+            file_name=harness_file_name,
+        )
         
         # model = model.merge_and_unload()
         
