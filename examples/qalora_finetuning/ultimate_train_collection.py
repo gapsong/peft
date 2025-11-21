@@ -921,7 +921,7 @@ def train():
             torch.cuda.reset_peak_memory_stats()
         start_time = time.time()
 
-        from eval_peft import run_lm_harness_and_print_results
+        from eval_peft import run_lm_harness_and_print_results, generate_alpaca_response
         from transformers import TrainerCallback
 
         def run_lm_harness_eval(model, tokenizer, evaluation_dir, eval_step):
@@ -939,6 +939,20 @@ def train():
             )
             print(f"✅ LM-Harness Ergebnisse gespeichert in: {evaluation_dir}/{harness_file_name}")
             eval_metrics = trainer.evaluate()
+            eval_loss = eval_metrics.get('eval_loss')
+            if eval_loss < currrent_eval_loss:
+                print("eval loss is: ", eval_loss)
+                print("The best run is generating example metrics")
+                alpaca_file_name = "alpaca_eval_results"
+                batchsize_alpaca_response = 32
+                generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name, batchsize_alpaca_response)
+                print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
+
+                metrics_path = os.path.join(evaluation_dir, f"{eval_step}_training_metrics.json")
+                with open(metrics_path, 'w') as f:
+                    json.dump(training_metrics, f, indent=4)
+                print(f"✅ Trainingsmetriken gespeichert in: {metrics_path}")
+                
 
         class CustomEvalCallback(TrainerCallback):
             def __init__(self, eval_fn, eval_args, eval_every_steps=250):
@@ -954,6 +968,8 @@ def train():
                     print("✅ Custom evaluation finished.\n")
                 return control
 
+                
+
         evaluation_dir = os.path.join(script_args.output_dir, "evaluation")
         os.makedirs(evaluation_dir, exist_ok=True)
 
@@ -966,6 +982,7 @@ def train():
         trainer.add_callback(custom_eval_callback)
         init_metrics = trainer.evaluate()
         print(f"initial eval_loss={init_metrics.get('eval_loss')}")
+        currrent_eval_loss = init_metrics.get('eval_loss')
         trainer.train()
         
         end_time = time.time()
@@ -1059,7 +1076,7 @@ def train():
         generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name, 32)
         print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
 
-        metrics_path = os.path.join(evaluation_dir, "training_metrics.json")
+        metrics_path = os.path.join(evaluation_dir, "final_training_metrics.json")
         with open(metrics_path, 'w') as f:
             json.dump(training_metrics, f, indent=4)
         print(f"✅ Trainingsmetriken gespeichert in: {metrics_path}")
