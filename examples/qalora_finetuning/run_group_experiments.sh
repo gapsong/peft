@@ -12,11 +12,9 @@ set -e
 # CONFIGURATION
 # ============================================================================
 MODEL_NAMES=(
-    "HuggingFaceTB/SmolLM2-1.7B"
-    # "HuggingFaceTB/SmolLM-1.7B"
-    # "TinyLlama/TinyLlama_v1.1"
-    # "meta-llama/Llama-3.2-1B"
-    # "microsoft/phi-2"
+    # "HuggingFaceTB/SmolLM2-1.7B"
+    "TinyLlama/TinyLlama_v1.1"
+    "microsoft/phi-1_5"
 )
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -34,7 +32,7 @@ export BASE_OUTPUT_DIR
 echo "BASE_OUTPUT_DIR=$BASE_OUTPUT_DIR"
 # --- Iteration Parameters ---
 # TRAINING_MODES=("qalora" "pissa_rank_analysis" "qalora_svd_error_two_adapter") 
-TRAINING_MODES=("lora" "qalora" "qalora_svd_error" "pissa_rank_analysis") 
+TRAINING_MODES=("qalora" "qalora_svd_error" "pissa_rank_analysis") 
 # LORA_RANKS=(8 16 32 64 128)
 LORA_RANKS=(4 8 16 32 64)
 BITS_LIST=(2)
@@ -46,7 +44,8 @@ DATA_PATH="yahma/alpaca-cleaned"
 DATASET_SPLIT="train[:15000]"
 DATASET_VAL_SPLIT="train[15000:16000]"
 NUM_TRAIN_EPOCHS=2
-PER_DEVICE_TRAIN_BATCH_SIZE=4
+PER_DEVICE_TRAIN_BATCH_SIZE=2
+GRADIENT_ACCUMULATION_STEPS=2
 LEARNING_RATE=1e-4
 MAX_LENGTH=2048
 WARMUP_RATIO=0.03
@@ -121,6 +120,7 @@ main() {
                                 --calibration_dataset="$dataset" \
                                 --num_train_epochs="$NUM_TRAIN_EPOCHS" \
                                 --per_device_train_batch_size="$PER_DEVICE_TRAIN_BATCH_SIZE" \
+                                --gradient_accumulation_steps="$GRADIENT_ACCUMULATION_STEPS" \
                                 --learning_rate="$LEARNING_RATE" \
                                 --lr_scheduler_type="$LR_SCHEDULER_TYPE" \
                                 --warmup_ratio="$WARMUP_RATIO" \
