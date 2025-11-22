@@ -69,7 +69,6 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-export WANDB_PROJECT="qalora-finetuning-${MODEL_SHORT_NAME}-groupsize-16-with-evaluation"
 # ============================================================================
 # Main Execution
 # ============================================================================
@@ -80,6 +79,8 @@ main() {
 
     for MODEL_NAME_OR_PATH in "${MODEL_NAMES[@]}"; do
         MODEL_SHORT_NAME="${MODEL_NAME_OR_PATH##*/}"
+        export WANDB_PROJECT="qalora-finetuning-${MODEL_SHORT_NAME}-groupsize-16-with-evaluation"
+
         log_info "========================================="
         log_info "Processing Model: ${MODEL_SHORT_NAME}"
         log_info "========================================="
