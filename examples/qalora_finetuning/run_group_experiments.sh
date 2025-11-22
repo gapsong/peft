@@ -69,8 +69,7 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-export WANDB_PROJECT="qalora-finetuning-${MODEL_SHORT_NAME}-groupsize-with-evaluation"
-
+export WANDB_PROJECT="qalora-finetuning-${MODEL_SHORT_NAME}-groupsize-16-with-evaluation"
 # ============================================================================
 # Main Execution
 # ============================================================================
