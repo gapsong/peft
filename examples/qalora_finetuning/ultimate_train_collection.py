@@ -943,16 +943,11 @@ def train():
             if eval_loss < currrent_eval_loss:
                 print("eval loss is: ", eval_loss)
                 print("The best run is generating example metrics")
-                alpaca_file_name = "alpaca_eval_results"
+                alpaca_file_name = f"{eval_step}_alpaca_eval_results"
                 batchsize_alpaca_response = 32
                 generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name, batchsize_alpaca_response)
                 print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
-
-                metrics_path = os.path.join(evaluation_dir, f"{eval_step}_training_metrics.json")
-                with open(metrics_path, 'w') as f:
-                    json.dump(training_metrics, f, indent=4)
-                print(f"✅ Trainingsmetriken gespeichert in: {metrics_path}")
-                
+                eval_loss = currrent_eval_loss 
 
         class CustomEvalCallback(TrainerCallback):
             def __init__(self, eval_fn, eval_args, eval_every_steps=250):
