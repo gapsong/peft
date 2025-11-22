@@ -31,13 +31,11 @@ fi
 export BASE_OUTPUT_DIR
 echo "BASE_OUTPUT_DIR=$BASE_OUTPUT_DIR"
 # --- Iteration Parameters ---
-# TRAINING_MODES=("qalora" "pissa_rank_analysis" "qalora_svd_error_two_adapter") 
 TRAINING_MODES=("qalora" "qalora_svd_error" "pissa_rank_analysis") 
-# LORA_RANKS=(8 16 32 64 128)
 LORA_RANKS=(4 8 16 32 64)
 BITS_LIST=(2)
 CALIBRATION_DATASETS=("c4")
-QALORA_GROUP_SIZES=(16)
+QALORA_GROUP_SIZES=(16 32)
 
 # --- Training Configuration ---
 DATA_PATH="yahma/alpaca-cleaned"
@@ -45,7 +43,7 @@ DATASET_SPLIT="train[:15000]"
 DATASET_VAL_SPLIT="train[15000:16000]"
 NUM_TRAIN_EPOCHS=2
 PER_DEVICE_TRAIN_BATCH_SIZE=2
-GRADIENT_ACCUMULATION_STEPS=2
+GRADIENT_ACCUMULATION_STEPS=3
 LEARNING_RATE=1e-4
 MAX_LENGTH=2048
 WARMUP_RATIO=0.03
@@ -71,7 +69,7 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-export WANDB_PROJECT="qalora-finetuning-smollm2-groupsize-with-evaluation"
+export WANDB_PROJECT="qalora-finetuning-${MODEL_SHORT_NAME}-groupsize-with-evaluation"
 
 # ============================================================================
 # Main Execution
