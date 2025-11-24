@@ -186,31 +186,6 @@ def preprocess(
         "labels": labels,
     }
 
-
-# @dataclass
-# class DataCollatorForSupervisedDataset:
-#     """Collate examples for supervised fine-tuning."""
-
-#     tokenizer: transformers.PreTrainedTokenizer
-
-#     def __call__(self, instances: Sequence[dict]) -> dict[str, torch.Tensor]:
-#         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
-        
-#         # Ensure they are detached tensors before padding to avoid graph errors
-#         input_ids = [torch.tensor(x).clone().detach() if isinstance(x, list) else x.clone().detach() for x in input_ids]
-#         labels = [torch.tensor(x).clone().detach() if isinstance(x, list) else x.clone().detach() for x in labels]
-        
-#         input_ids = torch.nn.utils.rnn.pad_sequence(
-#             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
-#         )
-#         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
-        
-#         return {
-#             "input_ids": input_ids,
-#             "labels": labels,
-#             "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
-#         }
- 
 @dataclass
 class DataCollatorForSupervisedDataset:
     """Collate examples for supervised fine-tuning."""
@@ -412,7 +387,7 @@ def train():
         trust_remote_code=True,
     )
     tokenizer.pad_token_id = tokenizer.eos_token_id
-
+    base_model = script_args.model_name_or_path
     if script_args.training_mode == "qalora":
         print("🔧 Setting up QA-LoRA training...")
         model = load_or_quantize_model(
@@ -475,11 +450,10 @@ def train():
             target_modules=target_modules,
             lora_dropout=0,
             bias="none",
-            init_lora_weights={
-                "method": "error-svd", 
+            init_lora_weights="error-svd",
+            svd_error_config={
                 "original_weights_map": original_weights_map,
                 "group_size": script_args.qalora_group_size,
-                "all_hessian_inverse_layers": torch.load("/home/gap/Documents/peft/quantized_models/HuggingFaceTB_SmolLM2-1.7B_gptq_2bit_groupsize_32_calibration_dataset_c4/all_hessian_inverse_layers/all_hessian_inverse_layers.pt"),
             },
         )
         del original_weights_map
@@ -488,24 +462,24 @@ def train():
         config = model.peft_config[adapter_name]
 
         # Überprüfen, ob die Initialisierungsmethode verwendet wurde und die problematischen Daten enthält
-        if hasattr(config, "init_lora_weights") and isinstance(config.init_lora_weights, dict):
+        if hasattr(config, "svd_error_config") and isinstance(config.svd_error_config, dict):
+            del config.svd_error_config
             # Entfernen Sie den Tensor oder das gesamte Dictionary.
             # Beides ist eine gute Lösung. Das Ersetzen durch einen einfachen Wert ist oft am sichersten.
-            print("Entferne nicht serialisierbare Tensor-Daten aus der Lora-Konfiguration vor dem Speichern...")
-            if "original_weights_map" in config.init_lora_weights:
-                del config.init_lora_weights["original_weights_map"]
-            if "W_orig" in config.init_lora_weights:
-                del config.init_lora_weights["W_orig"]
-            if "all_hessian_inverse_layers" in config.init_lora_weights:
-                del config.init_lora_weights["all_hessian_inverse_layers"]
-            if "method" in config.init_lora_weights:
-                del config.init_lora_weights["method"]
+            # print("Entferne nicht serialisierbare Tensor-Daten aus der Lora-Konfiguration vor dem Speichern...")
+            # if "original_weights_map" in config.init_lora_weights:
+            #     del config.init_lora_weights["original_weights_map"]
+            # if "W_orig" in config.init_lora_weights:
+            #     del config.init_lora_weights["W_orig"]
+            # if "all_hessian_inverse_layers" in config.init_lora_weights:
+            #     del config.init_lora_weights["all_hessian_inverse_layers"]
+            # if "method" in config.init_lora_weights:
+            #     del config.init_lora_weights["method"]
         
         # Cleanup
         del og_model
         torch.cuda.empty_cache()
         print("🧹 Original model freed from memory")
-        
     elif script_args.training_mode == "spqr_outlier":
         print("🔧 Setting up QA-LoRA training...")
         model = load_or_quantize_model(
@@ -670,8 +644,6 @@ def train():
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    
-    
     elif script_args.training_mode == "pissa":
         print("🔧 Setting up PiSSA training...")
         model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -691,18 +663,17 @@ def train():
         )
 
         model = get_peft_model(model, lora_config)
-    elif script_args.training_mode == "pissa_rank_analysis":
+    elif script_args.training_mode == "sa_svd":
         print("🔧 Setting up rank analysis with multiple quantization configurations...")
 
         model_name_clean = script_args.model_name_or_path.replace("/", "_").replace("\\", "_")
         base_output_dir = os.path.join(script_args.output_dir, f"quantized_residuals_r{script_args.lora_r}")
         os.makedirs(base_output_dir, exist_ok=True)
 
-        adapter_name = f"daniel_adapter_r{script_args.lora_r}_{model_name_clean}"
+        adapter_name = f"sa_svd__adapter_r{script_args.lora_r}_{model_name_clean}"
         adapter_path = os.path.join(base_output_dir, adapter_name)
 
         full_precision_residual_path = os.path.join(script_args.output_dir, f"{model_name_clean}_residual_base_r{script_args.lora_r}_fp16")
-
         if os.path.exists(adapter_path) and os.path.exists(full_precision_residual_path):
             print(f"⏭️  Found cached adapter at: {adapter_path}")
             print(f"⏭️  Found cached residual model at: {full_precision_residual_path}")
@@ -735,11 +706,11 @@ def train():
                 target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
                 lora_dropout=0,
                 bias="none",
-                init_lora_weights="daniel",
+                init_lora_weights="sa_svd",
             )
 
             peft_model = get_peft_model(model, lora_config)
-            print("✅ PEFT model with daniel initialization complete")
+            print("✅ PEFT model with sa_svd initialization complete")
 
             print(f"Phase 3: Saving adapter to: {adapter_path}")
             peft_model.save_pretrained(adapter_path)
@@ -810,7 +781,7 @@ def train():
         calibration_dataset = script_args.calibration_dataset
 
         quantized_name = (
-            f"w_res_{model_name_clean}_r{script_args.lora_r}_daniel_{bits}bit_gs{group_size}_{calibration_dataset}"
+            f"w_res_{model_name_clean}_r{script_args.lora_r}_sa_svd_{bits}bit_gs{group_size}_{calibration_dataset}"
         )
         quantized_path = os.path.join(base_output_dir, quantized_name)
 
@@ -823,6 +794,7 @@ def train():
             cache_key=os.path.basename(quantized_path),  # Use the filename as cache key
             calibration_dataset=calibration_dataset,
         )
+        base_model = quantized_path 
 
         # Attach LoRA adapter
         model = PeftModel.from_pretrained(model, adapter_path, is_trainable=True)
@@ -839,7 +811,6 @@ def train():
         print(f"Base model: {script_args.model_name_or_path}")
         print(f"LoRA rank: {script_args.lora_r}")
         print(f"Adapter saved to: {adapter_path}")
-
     elif script_args.training_mode == "lora":
         print("full finetuning")
         model = AutoModelForCausalLM.from_pretrained(
@@ -904,11 +875,13 @@ def train():
         "data_collator": data_collator,
     }
     results_params = utils.main(model, script_args.lora_r, script_args.qalora_group_size, "float16") 
-
+    print(results_params)
+    
     import wandb
     wandb.init()
     
     training_metrics = {}
+    adapter_output_dir = os.path.join(script_args.output_dir, "adapter")
 
     EVAL_SAMPLES = 100
     if not script_args.skip_training: 
@@ -924,60 +897,47 @@ def train():
         from eval_peft import run_lm_harness_and_print_results, generate_alpaca_response
         from transformers import TrainerCallback
 
-        def run_lm_harness_eval(model, tokenizer, evaluation_dir, eval_step):
-            tasks = "wikitext,mathqa,tinyMMLU"
-            harness_file_name = f"lm_harness_results_step_{eval_step}"
-            run_lm_harness_and_print_results(
-                model=model,
-                tokenizer=tokenizer,
-                tasks=tasks,
-                num_fewshot=1,
-                limit=EVAL_SAMPLES,
-                per_device_eval_batch_size=2,
-                output_dir=evaluation_dir,
-                file_name=harness_file_name,
-            )
-            print(f"✅ LM-Harness Ergebnisse gespeichert in: {evaluation_dir}/{harness_file_name}")
-            eval_metrics = trainer.evaluate()
-            eval_loss = eval_metrics.get('eval_loss')
-            if eval_loss < currrent_eval_loss:
-                print("eval loss is: ", eval_loss)
-                print("The best run is generating example metrics")
-                alpaca_file_name = f"{eval_step}_alpaca_eval_results"
-                batchsize_alpaca_response = 32
-                generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name, batchsize_alpaca_response)
-                print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
-                eval_loss = currrent_eval_loss 
+        class EvalSaveCallback(TrainerCallback):
+            def __init__(self, eval_steps, save_dir, trainer):
+                self.eval_steps = eval_steps
+                self.save_dir = save_dir
+                self.trainer = trainer  # Pass trainer instance to access .evaluate()
+                self.best_loss = float('inf')
 
-        class CustomEvalCallback(TrainerCallback):
-            def __init__(self, eval_fn, eval_args, eval_every_steps=250):
-                self.eval_fn = eval_fn
-                self.eval_args = eval_args
-                self.eval_every_steps = eval_every_steps
+            def _run_eval(self, step):
+                """Helper function to run evaluation and save if best."""
+                print(f"\n🔎 Evaluating at step {step}...")
+                
+                # Run evaluation
+                current_loss = self.trainer.evaluate().get('eval_loss', float('inf'))
+
+                if current_loss < self.best_loss:
+                    print(f"📉 New best loss: {current_loss}")
+                    self.best_loss = current_loss
+                    
+                    # Assuming 'model' and 'tokenizer' are available in scope
+                    # If not, access them via self.trainer.model / self.trainer.tokenizer
+                    model.save_pretrained(self.save_dir, safe_serialization=True)
+                    tokenizer.save_pretrained(self.save_dir)
+                    print(f"✅ Adapter saved to: {self.save_dir}\n")
+
+            def on_train_begin(self, args, state, control, **kwargs):
+                """Triggered exactly once before the first training step."""
+                self._run_eval(step=0)
 
             def on_step_end(self, args, state, control, **kwargs):
-                if state.global_step > 0 and state.global_step % self.eval_every_steps == 0:
-                    print(f"\n🔎 Running custom evaluation at step {state.global_step} ...")
-                    # eval_step als Argument übergeben
-                    self.eval_fn(**self.eval_args, eval_step=state.global_step)
-                    print("✅ Custom evaluation finished.\n")
-                return control
+                """Triggered at the end of every training step."""
+                if state.global_step % self.eval_steps == 0:
+                    self._run_eval(step=state.global_step)
 
-                
-
-        evaluation_dir = os.path.join(script_args.output_dir, "evaluation")
-        os.makedirs(evaluation_dir, exist_ok=True)
-
-        custom_eval_callback = CustomEvalCallback(
-            eval_fn=run_lm_harness_eval,
-            eval_args={"model": model, "tokenizer": tokenizer, "evaluation_dir": evaluation_dir},
-            eval_every_steps=script_args.eval_steps
+        # Initialize the callback, passing the trainer instance
+        custom_eval_callback = EvalSaveCallback(
+            eval_steps=script_args.eval_steps, 
+            save_dir=adapter_output_dir,
+            trainer=trainer
         )
 
         trainer.add_callback(custom_eval_callback)
-        init_metrics = trainer.evaluate()
-        print(f"initial eval_loss={init_metrics.get('eval_loss')}")
-        currrent_eval_loss = init_metrics.get('eval_loss')
         trainer.train()
         
         end_time = time.time()
@@ -990,17 +950,12 @@ def train():
             peak_vram_gb = 0.0
 
         final_loss = trainer.state.log_history[-1].get('loss') if trainer.state.log_history else None
-        
         training_metrics = {
             "peak_vram_gb": round(peak_vram_gb, 2),
             "training_time_min": round(training_duration_min, 2),
             "final_loss": final_loss,
         }
         
-        adapter_output_dir = os.path.join(script_args.output_dir, "adapter")
-        model.save_pretrained(adapter_output_dir, safe_serialization=True)
-        tokenizer.save_pretrained(adapter_output_dir)
-        print(f"✅ Adapter gespeichert in: {adapter_output_dir}")
     else:
         print("⏭️ Training übersprungen, wie angegeben.")
     
@@ -1031,14 +986,26 @@ def train():
             model.to("cuda") 
 
     if not script_args.skip_evaluation:
-        print("\n🚀 Starte Evaluation...")
+        print("\n🚀 Start final Evaluation...")
         model.eval()
 
         evaluation_dir = os.path.join(script_args.output_dir, "evaluation")
         os.makedirs(evaluation_dir, exist_ok=True)
 
-        from eval_peft import run_lm_harness_and_print_results
-        # tasks = "wikitext,piqa,tinyArc,tinyHellaswag,tinyGSM8k,tinyMMLU"
+        # load winning model
+        model = load_or_quantize_model(
+            base_model,
+            tokenizer,
+            qalora_group_size=script_args.qalora_group_size,
+            bits=script_args.bits,
+            calibration_dataset=script_args.calibration_dataset
+        )
+
+        # Attach LoRA adapter
+        model = PeftModel.from_pretrained(model, adapter_output_dir, is_trainable=False)
+        
+        trainer.evaluate()
+        
         tasks = "wikitext,mathqa,tinyMMLU"
         harness_file_name = "lm_harness_results"
         run_lm_harness_and_print_results(
@@ -1051,6 +1018,12 @@ def train():
             output_dir=evaluation_dir,
             file_name=harness_file_name,
         )
+        
+        print("The best run is generating example metrics")
+        alpaca_file_name = f"alpaca_eval_results"
+        BATCHSIZE_ALPACA_RESPONSE = 32
+        generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name, BATCHSIZE_ALPACA_RESPONSE)
+        print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
         
         # model = model.merge_and_unload()
         
@@ -1065,11 +1038,6 @@ def train():
         #     file_name=harness_file_name,
         # )
         # print(f"✅ LM-Harness Ergebnisse gespeichert in: {evaluation_dir}")
-
-        from eval_peft import generate_alpaca_response
-        alpaca_file_name = "alpaca_eval_results"
-        generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name, 32)
-        print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
 
         metrics_path = os.path.join(evaluation_dir, "final_training_metrics.json")
         with open(metrics_path, 'w') as f:

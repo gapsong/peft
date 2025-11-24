@@ -232,14 +232,16 @@ class LoraLayer(BaseTunerLayer):
             layer_name = kwargs["kwargs"]["current_key"]
 
         # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
-        if isinstance(init_lora_weights, str) and init_lora_weights.startswith("daniel"):
+        if isinstance(init_lora_weights, str) and init_lora_weights.startswith("sa_svd"):
             base_layer = self.get_base_layer() # if it got init already do not init it again. If we load it with a quantized layer it should not init it again since we have init it already before
             if hasattr(base_layer, "weight"):
                 with gather_params_ctx(self.base_layer.weight):
-                    self.daniel_init_svd_pooled_aware(adapter_name, init_lora_weights)
-                print("Init layer adapter with daniel")
+                    self.init_sa_svd_pooled_aware(adapter_name, init_lora_weights)
+                print("Init layer adapter with sa_svd")
             else:
-                print("Not init with daniel, we have init it already and just need to load the svd")
+                with gather_params_ctx(base_layer.dequantize_weight()):
+                    self.pool_layers_and_init_normal(adapter_name)
+                print("Not init with sa_svd, we have init it already and just need to load the svd")
         elif (
             isinstance(init_lora_weights, str) and init_lora_weights.startswith("avg-group-pooling")
         ) or (
@@ -270,33 +272,39 @@ class LoraLayer(BaseTunerLayer):
                 with gather_params_ctx(base_layer.dequantize_weight()):
                     self.spqr_svd_init(adapter_name, weights_map[layer_name], layer_name)
                 print(f"✅ Init layer adapter {layer_name} with spqr_outlier")
-        elif isinstance(init_lora_weights, dict) and init_lora_weights.get("method") == "error-svd":
+        elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("error-svd"):
             base_layer = self.get_base_layer()
-            if hasattr(base_layer, "dequantize_weight"):
+            if (
+                hasattr(base_layer, "dequantize_weight")
+            ):              
                 layer_name = kwargs["kwargs"]["current_key"]
+                init_lora_weights = kwargs["kwargs"]["lora_config"].svd_error_config
                 # if False:
-                if ".0." in layer_name: 
+                
+                should_init = "lora_config" in kwargs.get("kwargs", {}) and hasattr(kwargs["kwargs"]["lora_config"], "svd_error_config")and kwargs["kwargs"]["lora_config"].svd_error_config
+                
+                if should_init and ".0." in layer_name: 
                     # Hole die weights_map direkt aus dem init_lora_weights Dictionary
                     weights_map = init_lora_weights.get("original_weights_map", {})
-                    all_hessian_inverse_layers_map = init_lora_weights.get("all_hessian_inverse_layers", {})
+                    # all_hessian_inverse_layers_map = init_lora_weights.get("all_hessian_inverse_layers", {})
                     # Finde den Layer-Namen durch Dimensionsvergleich
                     layer_name = kwargs["kwargs"]["current_key"]
-                    cpu_hessian_inverse = all_hessian_inverse_layers_map[layer_name].to("cpu")
+                    # cpu_hessian_inverse = all_hessian_inverse_layers_map[layer_name].to("cpu")
                     # Erstelle das Dictionary für error_svd_init
                     init_dict_for_this_layer = {
                         "original_weight": weights_map[layer_name],
                         "group_size": init_lora_weights.get("group_size"),
-                        "hessian_inverse_layer": cpu_hessian_inverse
+                        # "hessian_inverse_layer": cpu_hessian_inverse
                     }
                         
                     with gather_params_ctx(base_layer.dequantize_weight()):
                         self.error_svd_init(adapter_name, init_dict_for_this_layer)
                         del init_dict_for_this_layer
-                        del all_hessian_inverse_layers_map 
+                        # del all_hessian_inverse_layers_map 
                         # nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
                         # nn.init.zeros_(self.lora_B[adapter_name].weight)
                     print(f"✅ Init layer adapter {layer_name} with error-svd")
-                else:
+                elif ".0." not in layer_name:
                     with gather_params_ctx(base_layer.dequantize_weight()):
                         self.pool_layers_and_init_normal(adapter_name)
                     print(f"✅ Init layer and pooled down {layer_name}")
@@ -459,7 +467,7 @@ class LoraLayer(BaseTunerLayer):
         self.get_base_layer().weight.data = weight_residual.to(self.get_base_layer().weight.dtype)
         print("✅ Basis-Layer wurde mit dem Residual aktualisiert.")
 
-    def daniel_init_svd_pooled_aware(self, adapter_name, init_lora_weights):
+    def init_sa_svd_pooled_aware(self, adapter_name, init_lora_weights):
         """
         Initialisiert LoRA-Adapter A und B via "SVD Pooled Aware"-Methode.
         Die SVD wird auf einer strukturell gepoolten Version der Gewichtsmatrix durchgeführt.
@@ -503,7 +511,7 @@ class LoraLayer(BaseTunerLayer):
         # ========================================================================
 
         # 4. Führe SVD auf der *gepoolten* Matrix durch
-        if init_lora_weights == "daniel":
+        if init_lora_weights == "sa_svd":
             U, S, Vh = torch.linalg.svd(weight_pooled.data, full_matrices=False)
         else:
             raise ValueError(f"Unknown init_lora_weights: {init_lora_weights}")
@@ -673,27 +681,7 @@ class LoraLayer(BaseTunerLayer):
         if Wq.shape != Worig.shape:
             raise ValueError(f"[error-svd] Shape-Mismatch: W_orig {tuple(Worig.shape)} vs W_q {tuple(Wq.shape)}")
 
-        # if Wq.shape[0] == Wq.shape[1]:
-        #     Wq = Wq.t()
-        
-        # E = W_orig - W_q
         E = (Worig - Wq).to(torch.float32)
-        # E_corrected = E @ init_lora_weights.get("hessian_inverse_layer", {}).to(E.device, dtype=E.dtype)
-
-        # SVD(E_corrected)
-        # U, S, Vh = torch.linalg.svd(E_corrected, full_matrices=False)
-        # r_eff = min(r, U.shape[1], Vh.shape[0])
-        # Ur, Sr, Vh_r = U[:, :r_eff], S[:r_eff], Vh[:r_eff, :]
-
-        # # Split singular values into A/B
-        # Sr_scaled = (Sr / max(s, 1e-12)).clamp_min(1e-12)
-        # sqrtS = torch.sqrt(Sr_scaled)
-        # B_svd_corrected = Ur @ torch.diag(sqrtS)
-        # A_svd = torch.diag(sqrtS) @ Vh_r
-
-        # # Adjust for QA-LoRA scaling factor g
-        # A_store_svd_corrected = A_svd
-
         # SVD(E)
         U, S, Vh = torch.linalg.svd(E, full_matrices=True)
         r_eff = min(r, U.shape[1], Vh.shape[0])
@@ -706,32 +694,18 @@ class LoraLayer(BaseTunerLayer):
         A_svd = torch.diag(sqrtS) @ Vh_r
 
         # Adjust for QA-LoRA scaling factor g
-        A_store = A_svd
+        A_store = A_svd / g
 
-        # Assign weights
-        corrected_Error = False
-        
-        if corrected_Error:
-            self.lora_A[adapter_name].weight.data.copy_(A_store_svd_corrected.to(self.lora_A[adapter_name].weight.dtype))
-            self.lora_B[adapter_name].weight.data.copy_(B_svd_corrected.to(self.lora_B[adapter_name].weight.dtype))
-            try:
-                approx = s * (B @ (A_store_svd_corrected))
-                rel_err = torch.linalg.norm(E - approx) / (torch.linalg.norm(E) + 1e-12)
-                print(f"[error-svd] Init successful corrected for {adapter_name}. Relative error: {rel_err.item():.3e}")
-            except Exception:
-                pass
-        
-        else:
-            self.lora_A[adapter_name].weight.data.copy_(A_store.to(self.lora_A[adapter_name].weight.dtype))
-            self.lora_B[adapter_name].weight.data.copy_(B.to(self.lora_B[adapter_name].weight.dtype))
+        self.lora_A[adapter_name].weight.data.copy_(A_store.to(self.lora_A[adapter_name].weight.dtype))
+        self.lora_B[adapter_name].weight.data.copy_(B.to(self.lora_B[adapter_name].weight.dtype))
 
-            # Optional: Diagnostic print
-            try:
-                approx = s * (B @ (A_svd))
-                rel_err = torch.linalg.norm(E - approx) / (torch.linalg.norm(E) + 1e-12)
-                print(f"[error-svd] Init successful for {adapter_name}. Relative error: {rel_err.item():.3e}")
-            except Exception:
-                pass
+        # Optional: Diagnostic print
+        try:
+            approx = s * (B @ (A_svd))
+            rel_err = torch.linalg.norm(E - approx) / (torch.linalg.norm(E) + 1e-12)
+            print(f"[error-svd] Init successful for {adapter_name}. Relative error: {rel_err.item():.3e}")
+        except Exception:
+            pass
 
 
     def transpose(weight, fan_in_fan_out):

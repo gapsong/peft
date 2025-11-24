@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Union
+from typing import Literal, Optional, Union, Dict, Any
 
 from torch import nn
 
@@ -118,6 +118,12 @@ class EvaConfig:
             raise ValueError("`rho` must be >= 1.0")
         if self.tau < 0.0 or self.tau > 1.0:
             raise ValueError("`tau` must be between 0.0 and 1.0.")
+
+@dataclass
+class SVDErrorConfig:
+    group_size: int
+    original_weights_map: Dict[str, Any]
+    scale_factor: float = 1.0
 
 
 @dataclass
@@ -491,6 +497,15 @@ class LoraConfig(PeftConfig):
         },
     )
     corda_config: Optional[CordaConfig] = field(
+        default=None,
+        metadata={
+            "help": (
+                "The configuration of CorDA. If this is passed, then CorDA will be used to build the adapter layers. "
+                "Also set `init_lora_weights='corda'` in this case."
+            )
+        },
+    )
+    svd_error_config: Optional[SVDErrorConfig] = field(
         default=None,
         metadata={
             "help": (

@@ -350,10 +350,10 @@ class QALoraLinearVariant(LoraVariant):
             module.qalora_group_size = {}
         module.qalora_group_size[adapter_name] = qalora_group_size
 
-        old_lora_A_layer = module.lora_A[adapter_name]
+        # old_lora_A_layer = module.lora_A[adapter_name]
 
-        if module.in_features == old_lora_A_layer.in_features:
-            module.pool_layers_and_init_normal(adapter_name) 
+        # if module.in_features == old_lora_A_layer.in_features:
+        #     module.pool_layers_and_init_normal(adapter_name) 
 
     @staticmethod
     def get_delta_weight(module: Linear, active_adapter: str) -> torch.Tensor:
