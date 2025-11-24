@@ -33,151 +33,236 @@ import os
 import torch
 from safetensors import safe_open
 import transformers
-from accelerate.commands.estimate import create_empty_model
 from accelerate.utils.other import convert_bytes
 import torch.nn as nn
 from transformers import AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
+import argparse
+import re
+import struct
+from pathlib import Path
 
 # suppress all warnings and logs
 warnings.filterwarnings("ignore")
 transformers.logging.set_verbosity_error()
 
-dtype_to_bytes_linear = {"float32": 4, "float16": 2, "bfloat16": 2, "int8": 1, "int4": 0.5}
-# no quantization if not Linear, assume 16 bit instead
-dtype_to_bytes_other = {"float32": 4, "float16": 2, "bfloat16": 2, "int8": 2, "int4": 2}
+# ==========================================
+# KONSTANTEN
+# ==========================================
 LORA = "lora"
 QALORA = "qalora"
 
+# Byte-Größen Definitionen
+dtype_to_bytes_linear = {"float32": 4, "float16": 2, "bfloat16": 2, "int8": 1, "int4": 0.5}
+dtype_to_bytes_other = {"float32": 4, "float16": 2, "bfloat16": 2, "int8": 2, "int4": 2}
 
-def get_num_params(param):  # from PEFT
-    """Get the number of parameters from an nn.Parameter"""
-    num_params = param.numel()
-    # if using DS Zero 3 and the weights are initialized empty
-    if num_params == 0 and hasattr(param, "ds_numel"):
-        num_params = param.ds_numel
+# ==========================================
+# HELPER: OFFLINE PARSING (Low Level)
+# ==========================================
+def read_safetensors_header_direct(file_path: Path):
+    """
+    Liest den Header einer Safetensors Datei direkt binär.
+    Benötigt KEINE externen Libraries (nur Python 'struct').
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            # Die ersten 8 Bytes sind ein uint64 (Länge des Headers)
+            header_length_bytes = f.read(8)
+            if not header_length_bytes: return {}
+            
+            # Little-Endian Unsigned Long Long (<Q)
+            header_length = struct.unpack('<Q', header_length_bytes)[0]
 
-    # Due to the design of 4bit linear layers from bitsandbytes
-    # one needs to multiply the number of parameters by 2 to get
-    # the correct number of parameters
-    if param.__class__.__name__ == "Params4bit":
-        if hasattr(param, "element_size"):
-            num_bytes = param.element_size()
-        elif not hasattr(param, "quant_storage"):
-            num_bytes = 1
+            # Den Header JSON String lesen
+            header_bytes = f.read(header_length)
+            header = json.loads(header_bytes.decode('utf-8'))
+            return header
+    except Exception as e:
+        print(f"⚠️ Fehler beim Lesen von {file_path.name}: {e}", file=sys.stderr)
+        return {}
+
+def convert_bytes(size):
+    """Einfache Konvertierung ohne 'accelerate' Library"""
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} PB"
+
+# ==========================================
+# CORE LOGIC
+# ==========================================
+def analyze_local_model(model_path_str, rank, group_size):
+    """
+    Analysiert lokale Safetensors Dateien in einem Ordner.
+    """
+    base_path = Path(model_path_str)
+    
+    if not base_path.exists():
+        print(f"❌ Pfad nicht gefunden: {base_path}", file=sys.stderr)
+        return None
+
+    # 1. Dateien finden (Sharding Support)
+    files_to_scan = []
+    
+    if base_path.is_file():
+        # User hat direkt auf eine Datei gezeigt
+        files_to_scan = [base_path.name]
+        base_path = base_path.parent
+    elif base_path.is_dir():
+        # Check auf index.json (Sharding Index)
+        index_file = base_path / "model.safetensors.index.json"
+        if index_file.exists():
+            try:
+                with open(index_file, 'r') as f:
+                    data = json.load(f)
+                    # Deduplizierte Liste aller Split-Dateien
+                    files_to_scan = list(set(data["weight_map"].values()))
+                # print(f"📂 Sharded Modell erkannt ({len(files_to_scan)} Teile).", file=sys.stderr)
+            except Exception as e:
+                print(f"⚠️ Index defekt, suche manuell nach .safetensors...", file=sys.stderr)
+                files_to_scan = [f.name for f in base_path.glob("*.safetensors")]
         else:
-            num_bytes = param.quant_storage.itemsize
-        num_params = num_params * 2 * num_bytes
-    return num_params
+            # Keine Index Datei, wir nehmen alle safetensors im Root
+            files_to_scan = [f.name for f in base_path.glob("*.safetensors")]
+            if not files_to_scan:
+                # Fallback: Manche Repos nennen es 'adapter_model.safetensors'
+                files_to_scan = [f.name for f in base_path.glob("*model*.safetensors")]
 
+    if not files_to_scan:
+        print("❌ Keine .safetensors Dateien im angegebenen Pfad gefunden.", file=sys.stderr)
+        return None
 
-def get_param_count(model, rank, group_size):
-    """Get the number of parameters in a model, including LoRA parameters"""
-    # this is only an approximation because we ignore buffers
-    # model = create_empty_model(model_id, "transformers")
-    model = create_empty_model("TinyLlama/TinyLlama_v1.1", "transformers")
-    count_params = defaultdict(int)
-    for module in model.modules():
-        if len(list(module.children())) > 0:
-            continue  # not leaf
+    # Regex für Target Modules (Linear Layers)
+    target_pattern = re.compile(r".*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|fc[12]|dense)\.(weight|qweight)$")
+    
+    stats = defaultdict(int)
 
-        module_name = str(module).split("(", 1)[0]
-        for param_name, param in module.named_parameters():
-            key = f"{module_name}.{param_name}"
-            count_params[key] += get_num_params(param)
-            if key == "Linear.weight":
-                m, n = param.shape
-                count_params[LORA] += m * rank + n * rank
-                count_params[QALORA] += m * rank + (n // group_size) * rank
-    count_params = dict(count_params)
+    # 2. Iteration über Dateien
+    for filename in files_to_scan:
+        full_path = base_path / filename
+        if not full_path.exists():
+            continue
+            
+        header = read_safetensors_header_direct(full_path)
+        
+        for param_name, info in header.items():
+            if param_name == '__metadata__': continue
+            
+            shape = info.get('shape', [])
+            
+            # Base Params zählen
+            num_params = 1
+            for s in shape: num_params *= s
+            
+            # A) Overhead (Scales/Zeros)
+            if any(x in param_name for x in ["scales", "qzeros", "g_idx", "absmax"]):
+                stats["Metadata/Overhead"] += num_params
+                continue
 
-    # checking against transformers count
-    assert 4 * sum(v for k, v in count_params.items() if k != LORA and k != QALORA) == model.get_memory_footprint(
-        False
-    )
-    return count_params
+            # B) Base Params Classification
+            if "weight" in param_name or "qweight" in param_name:
+                 stats["Linear.weight"] += num_params
+            else:
+                 stats["Metadata/Overhead"] += num_params
 
+            # C) LoRA / QALoRA Berechnung
+            if target_pattern.match(param_name):
+                
+                # Dimensionen wiederherstellen
+                if "qweight" in param_name:
+                    # GPTQ: Shape ist [In/8, Out] -> Wir brauchen [In, Out]
+                    # Annahme: 4-bit Quantisierung -> Packing Factor 8
+                    # Heuristik: input ist meist die gepackte Dimension
+                    dim1 = shape[0]
+                    dim2 = shape[1]
+                    n_in = dim1 * 8
+                    m_out = dim2
+                else:
+                    # Normal: [Out, In] 
+                    m_out = shape[0]
+                    n_in = shape[1]
 
+                # LoRA:  (In * r) + (Out * r)
+                stats[LORA] += (n_in * rank) + (m_out * rank)
+                
+                # QALoRA: (In * r / G) + (Out * r)
+                stats[QALORA] += ((n_in // group_size) * rank) + (m_out * rank)
+
+    return dict(stats)
+
+# ==========================================
+# MEMORY CALCULATION
+# ==========================================
 def get_param_bytes(count_params, dtype):
-    """Get the number of bytes in a model, including LoRA parameters"""
     num_bytes = defaultdict(int)
+    
     for key, val in count_params.items():
         if key == "Linear.weight":
             num_bytes[key] = int(val * dtype_to_bytes_linear[dtype])
+        
         elif key == LORA:
-            # we assume that LoRA is always loaded in float32
             num_bytes[key] = int(val * dtype_to_bytes_other["float32"])
+        
         elif key == QALORA:
-            # we assume that QALORA is always loaded in bfloat16
-            num_bytes[key] = int(val * dtype_to_bytes_other["float16"])
+            num_bytes[key] = int(val * dtype_to_bytes_other["bfloat16"])
+        
         else:
+            # Metadata/Overhead
             num_bytes[key] = int(val * dtype_to_bytes_other[dtype])
-    num_bytes = dict(num_bytes)
-
-    return num_bytes
+            
+    return dict(num_bytes)
 
 
 def get_training_memory_estimate(num_bytes):
-    """Get the memory estimate for fine-tuning a model
-
-    Simplified assumptions: don't include activation size, automatic mixed precision, etc.
-
-    We assume that Adam is used, which gives us:
-
-    - size of model itself
-    - size of gradients (trainable parameters only)
-    - size of 1st and 2nd momentum of Adam (trainable parameters only)
-
-    """
-    adapter_keys = [LORA, QALORA]  # Define known adapter keys
+    adapter_keys = [LORA, QALORA]
     total_size_base = sum(v for k, v in num_bytes.items() if k not in adapter_keys)
-    factor = 1 + 1 + 1  # model_params + gradients + optimizer_states
+    
+    # Factor: Model Weights + Gradients + Optimizer States
+    # Simplified estimate
+    factor = 3 
+
     estimates = {
-        "memory full fine-tuning": total_size_base + factor * total_size_base,
+        "memory full fine-tuning": total_size_base + (factor * total_size_base),
     }
 
     if LORA in num_bytes:
-        trainable_bytes_lora = num_bytes[LORA]
-        estimates["memory LoRA fine-tuning"] = total_size_base + factor * trainable_bytes_lora
+        estimates["memory LoRA fine-tuning"] = total_size_base + (factor * num_bytes[LORA])
 
     if QALORA in num_bytes:
-        trainable_bytes_qalora = num_bytes[QALORA]
-        estimates["memory QALoRA fine-tuning"] = total_size_base + factor * trainable_bytes_qalora
+        estimates["memory QALoRA fine-tuning"] = total_size_base + (factor * num_bytes[QALORA])
 
     return estimates
 
+# ==========================================
+# MAIN
+# ==========================================
+def main(model_path, rank, group_size, dtype, sink=print):
+    
+    # 1. Struktur Analyse (Lokal)
+    count_params = analyze_local_model(model_path, rank=rank, group_size=group_size)
+    
+    if not count_params:
+        return
 
-def main(model, rank, group_size, dtype, sink=print):
-    """Main function to calculate memory requirements of a model.
-
-    Outputs the results in JSON format.
-
-    Args:
-        model_id (str): Model name (on Hugging Face)
-        rank (int): Rank of LoRA adapter
-        dtype (str): Data type, one of float32, float16, bfloat16, int8, int4
-        sink (function): Function to print the result with (default: print).
-    """
-    count_params = get_param_count(model, rank=rank, group_size=group_size)
+    # 2. Byte Berechnung
     num_bytes = get_param_bytes(count_params, dtype=dtype)
     num_bytes_readable = {k: convert_bytes(v) for k, v in num_bytes.items()}
 
-    adapter_keys = [LORA, QALORA]  # Define known adapter keys
+    adapter_keys = [LORA, QALORA]
 
-    # Calculate total parameters/size for the base model (excluding all adapters)
+    # Stats aggregieren
     total_params_base = sum(v for k, v in count_params.items() if k not in adapter_keys)
     total_size_base = sum(v for k, v in num_bytes.items() if k not in adapter_keys)
-    total_size_base_readable = convert_bytes(total_size_base)
-
-    # Calculate total parameters/size including all adapters
+    
     total_params_with_adapters = sum(count_params.values())
     total_size_with_adapters = sum(num_bytes.values())
-    total_size_with_adapters_readable = convert_bytes(total_size_with_adapters)
 
     training_bytes = get_training_memory_estimate(num_bytes)
     training_bytes_readable = {k: convert_bytes(v) for k, v in training_bytes.items()}
 
+    # JSON Result
     result = {
         "number of parameters": count_params,
         "number of bytes": num_bytes,
@@ -186,11 +271,11 @@ def main(model, rank, group_size, dtype, sink=print):
         "total number of parameters (with adapters)": total_params_with_adapters,
         "total size (base model)": total_size_base,
         "total size (with adapters)": total_size_with_adapters,
-        "total size (base model, readable)": total_size_base_readable,
-        "total size (with adapters, readable)": total_size_with_adapters_readable,
+        "total size (base model, readable)": convert_bytes(total_size_base),
+        "total size (with adapters, readable)": convert_bytes(total_size_with_adapters),
     }
 
-    # Dynamically add training memory estimates to the result
+    # Estimates einfügen
     if "memory full fine-tuning" in training_bytes_readable:
         result["memory required for full fine-tuning"] = training_bytes_readable["memory full fine-tuning"]
     if "memory LoRA fine-tuning" in training_bytes_readable:
@@ -199,16 +284,57 @@ def main(model, rank, group_size, dtype, sink=print):
         result["memory required for QALoRA fine-tuning"] = training_bytes_readable["memory QALoRA fine-tuning"]
 
     if dtype.startswith("int"):
-        if "memory required for full fine-tuning" in result:  # Check if key exists before trying to append
+        if "memory required for full fine-tuning" in result:
             result["memory required for full fine-tuning"] += "*"
 
     sink(json.dumps(result, indent=2))
-
+    
     if dtype.startswith("int"):
         print("*Note that quantized models cannot be fine-tuned without PEFT", file=sys.stderr)
+    
     return result
 
+def calc_qalora_stats(model_path, rank, group_size):
+    """Berechnet LoRA vs QALoRA Params offline (Direct Header Read)."""
+    path = Path(model_path)
+    if not path.exists(): return None
 
+    # 1. Dateien finden (Sharding Support)
+    files = []
+    index_path = path / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path, 'r') as f: files = list(set(json.load(f)["weight_map"].values()))
+    else:
+        files = [f.name for f in path.glob("*.safetensors")]
+
+    # 2. Scannen
+    stats = {"lora_params": 0, "qalora_params": 0}
+    # Regex für Linear Layers (Llama, Mistral, etc.)
+    layer_re = re.compile(r".*\.(q|k|v|o|gate|up|down|fc\d|dense)\.(weight|qweight)$")
+
+    for fname in files:
+        try:
+            with open(path / fname, 'rb') as f:
+                # Header Länge lesen (uint64) + Header parsen
+                header_len = struct.unpack('<Q', f.read(8))[0]
+                header = json.loads(f.read(header_len).decode('utf-8'))
+            
+            for name, info in header.items():
+                if not layer_re.match(name): continue
+                
+                shape = info['shape']
+                # GPTQ (qweight) vs Normal Handling
+                if "qweight" in name:
+                    n_in, m_out = shape[0] * 8, shape[1] # Annahme: 4-bit Packing
+                else:
+                    m_out, n_in = shape[0], shape[1] # Standard: [Out, In]
+
+                stats["lora_params"] += (n_in * rank) + (m_out * rank)
+                stats["qalora_params"] += ((n_in // group_size) * rank) + (m_out * rank)
+        except: continue
+
+    stats["saved_params"] = stats["lora_params"] - stats["qalora_params"]
+    return stats
 
 def load_all_lr_layers(adapter_path):
     """

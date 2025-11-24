@@ -13,23 +13,34 @@
 # limitations under the License.
 
 import copy
+import json
 import os
 import random
-import json
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List
+
 import numpy as np
 import torch
-import transformers
-# from utils import main, compare_models
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM, GPTQConfig, Trainer
-from transformers.trainer_callback import ProgressCallback
-from peft import LoraConfig, PeftModel, get_peft_model
+
 import datasets
+from datasets import load_dataset
+
+import transformers
+from transformers import (
+    AutoModelForCausalLM,
+    GPTQConfig,
+    Trainer,
+    TrainerCallback,
+)
+from transformers.trainer_callback import ProgressCallback
+
+from peft import LoraConfig, PeftModel, get_peft_model
+
 import utils
+from eval_peft import run_lm_harness_and_print_results, generate_alpaca_response
+
 
 is_training_on_cluster = os.environ.get("TRAIN_MODE", "").lower() == "cluster"
 if is_training_on_cluster:
@@ -874,9 +885,6 @@ def train():
         "eval_dataset": eval_dataset,
         "data_collator": data_collator,
     }
-    results_params = utils.main(model, script_args.lora_r, script_args.qalora_group_size, "float16") 
-    print(results_params)
-    
     import wandb
     wandb.init()
     
@@ -893,9 +901,6 @@ def train():
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         start_time = time.time()
-
-        from eval_peft import run_lm_harness_and_print_results, generate_alpaca_response
-        from transformers import TrainerCallback
 
         class EvalSaveCallback(TrainerCallback):
             def __init__(self, eval_steps, save_dir, trainer):
@@ -938,6 +943,25 @@ def train():
         )
 
         trainer.add_callback(custom_eval_callback)
+
+        tasks = "wikitext,mathqa,tinyMMLU"
+        initial_harness_file_name = "lm_harness_results_initial"
+        evaluation_dir = os.path.join(script_args.output_dir, "evaluation")
+        os.makedirs(evaluation_dir, exist_ok=True)
+        
+        # model.eval()
+        # run_lm_harness_and_print_results(
+        #     model=model,
+        #     tokenizer=tokenizer,
+        #     tasks=tasks,
+        #     num_fewshot=1,
+        #     limit=EVAL_SAMPLES,
+        #     per_device_eval_batch_size=2,
+        #     output_dir=evaluation_dir,
+        #     file_name=initial_harness_file_name,
+        # )
+        # model.train()
+
         trainer.train()
         
         end_time = time.time()
@@ -989,9 +1013,6 @@ def train():
         print("\n🚀 Start final Evaluation...")
         model.eval()
 
-        evaluation_dir = os.path.join(script_args.output_dir, "evaluation")
-        os.makedirs(evaluation_dir, exist_ok=True)
-
         # load winning model
         model = load_or_quantize_model(
             base_model,
@@ -1008,22 +1029,22 @@ def train():
         
         tasks = "wikitext,mathqa,tinyMMLU"
         harness_file_name = "lm_harness_results"
-        run_lm_harness_and_print_results(
-            model=model,
-            tokenizer=tokenizer,
-            tasks=tasks,
-            num_fewshot=1,
-            limit=EVAL_SAMPLES,
-            per_device_eval_batch_size=2,
-            output_dir=evaluation_dir,
-            file_name=harness_file_name,
-        )
+        # run_lm_harness_and_print_results(
+        #     model=model,
+        #     tokenizer=tokenizer,
+        #     tasks=tasks,
+        #     num_fewshot=1,
+        #     limit=EVAL_SAMPLES,
+        #     per_device_eval_batch_size=2,
+        #     output_dir=evaluation_dir,
+        #     file_name=harness_file_name,
+        # )
         
-        print("The best run is generating example metrics")
-        alpaca_file_name = f"alpaca_eval_results"
-        BATCHSIZE_ALPACA_RESPONSE = 32
-        generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name, BATCHSIZE_ALPACA_RESPONSE)
-        print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
+        # print("The best run is generating example metrics")
+        # alpaca_file_name = f"alpaca_eval_results"
+        # BATCHSIZE_ALPACA_RESPONSE = 32
+        # generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name, BATCHSIZE_ALPACA_RESPONSE)
+        # print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
         
         # model = model.merge_and_unload()
         
@@ -1038,10 +1059,25 @@ def train():
         #     file_name=harness_file_name,
         # )
         # print(f"✅ LM-Harness Ergebnisse gespeichert in: {evaluation_dir}")
+        
+        try:
+            print("📊 Calculating QALoRA Stats...")
+            param_stats = utils.main(
+                model.active_peft_config.base_model_name_or_path, 
+                script_args.lora_r, 
+                script_args.qalora_group_size,
+                "bfloat16"
+            )
+            if param_stats:
+                training_metrics["parameter_metrics"] = param_stats
+                print(f"✅ Params: {param_stats}")
+        except Exception as e:
+            print(f"Could not caluculate param_stats.")
 
         metrics_path = os.path.join(evaluation_dir, "final_training_metrics.json")
         with open(metrics_path, 'w') as f:
             json.dump(training_metrics, f, indent=4)
+            
         print(f"✅ Trainingsmetriken gespeichert in: {metrics_path}")
     else:
         print("⏭️ Evaluation übersprungen, wie angegeben.")
