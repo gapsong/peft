@@ -128,6 +128,9 @@ def evaluate_with_lm_eval(model, tokenizer, tasks, num_fewshot=5, limit=None, pe
         batch_size=per_device_eval_batch_size,
     )
 
+    if "config" in results:
+        del results["config"]
+
     try:
         wandb_logger = WandbLogger()
         wandb_logger.post_init(results)
