@@ -949,18 +949,18 @@ def train():
         evaluation_dir = os.path.join(script_args.output_dir, "evaluation")
         os.makedirs(evaluation_dir, exist_ok=True)
         
-        # model.eval()
-        # run_lm_harness_and_print_results(
-        #     model=model,
-        #     tokenizer=tokenizer,
-        #     tasks=tasks,
-        #     num_fewshot=1,
-        #     limit=EVAL_SAMPLES,
-        #     per_device_eval_batch_size=2,
-        #     output_dir=evaluation_dir,
-        #     file_name=initial_harness_file_name,
-        # )
-        # model.train()
+        model.eval()
+        run_lm_harness_and_print_results(
+            model=model,
+            tokenizer=tokenizer,
+            tasks=tasks,
+            num_fewshot=1,
+            limit=EVAL_SAMPLES,
+            per_device_eval_batch_size=2,
+            output_dir=evaluation_dir,
+            file_name=initial_harness_file_name,
+        )
+        model.train()
 
         trainer.train()
         
@@ -1029,22 +1029,22 @@ def train():
         
         tasks = "wikitext,mathqa,tinyMMLU"
         harness_file_name = "lm_harness_results"
-        # run_lm_harness_and_print_results(
-        #     model=model,
-        #     tokenizer=tokenizer,
-        #     tasks=tasks,
-        #     num_fewshot=1,
-        #     limit=EVAL_SAMPLES,
-        #     per_device_eval_batch_size=2,
-        #     output_dir=evaluation_dir,
-        #     file_name=harness_file_name,
-        # )
+        run_lm_harness_and_print_results(
+            model=model,
+            tokenizer=tokenizer,
+            tasks=tasks,
+            num_fewshot=1,
+            limit=EVAL_SAMPLES,
+            per_device_eval_batch_size=2,
+            output_dir=evaluation_dir,
+            file_name=harness_file_name,
+        )
         
-        # print("The best run is generating example metrics")
-        # alpaca_file_name = f"alpaca_eval_results"
-        # BATCHSIZE_ALPACA_RESPONSE = 32
-        # generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name, BATCHSIZE_ALPACA_RESPONSE)
-        # print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
+        print("The best run is generating example metrics")
+        alpaca_file_name = f"alpaca_eval_results"
+        BATCHSIZE_ALPACA_RESPONSE = 32
+        generate_alpaca_response(model, tokenizer, script_args.training_mode, script_args.lora_r, evaluation_dir, alpaca_file_name, BATCHSIZE_ALPACA_RESPONSE)
+        print(f"✅ AlpacaEval Ergebnisse gespeichert in: {evaluation_dir}")
         
         # model = model.merge_and_unload()
         
