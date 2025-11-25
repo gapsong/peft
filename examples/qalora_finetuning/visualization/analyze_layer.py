@@ -10,7 +10,7 @@ Subcommands:
 
 This script follows your naming pattern for quantized residuals:
   <experiment_dir>/quantized_residuals_r{rank}/
-    w_res_{model_clean}_r{rank}_daniel_{bits}bit_gs{group_size}_{dataset}
+    w_res_{model_clean}_r{rank}_sa_svd_{bits}bit_gs{group_size}_{dataset}
 
 Where model_clean == model_name_or_path with '/' and '\\' replaced by '_'.
 """
@@ -178,7 +178,7 @@ def dump_tensors(
     # 2) R_quant from quantized residual model
     model_clean = model_name_or_path.replace("/", "_").replace("\\", "_")
     qres_dir = os.path.join(experiment_dir, f"quantized_residuals_r{rank}")
-    qres_name = f"w_res_{model_clean}_r{rank}_daniel_{bits}bit_gs{group_size}_{dataset}"
+    qres_name = f"w_res_{model_clean}_r{rank}_sa_svd_{bits}bit_gs{group_size}_{dataset}"
     qres_path = os.path.join(qres_dir, qres_name)
 
     print(f"[dump] Loading quantized residual model: {qres_path}")
@@ -752,7 +752,7 @@ def main():
         required=False,
         help=(
             "Repeatable: TAG=PATH to adapter folder (contains adapter_model.safetensors & adapter_config.json). "
-            "Example: pre=/.../quantized_residuals_r4/daniel_adapter_r4_...  "
+            "Example: pre=/.../quantized_residuals_r4/sa_svd_adapter_r4_...  "
             "ft=/.../SmolLM2-.../ft/adapter  qalora=/.../_qalora_.../ft/adapter"
         ),
     )

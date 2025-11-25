@@ -681,7 +681,7 @@ def train():
         base_output_dir = os.path.join(script_args.output_dir, f"quantized_residuals_r{script_args.lora_r}")
         os.makedirs(base_output_dir, exist_ok=True)
 
-        adapter_name = f"sa_svd__adapter_r{script_args.lora_r}_{model_name_clean}"
+        adapter_name = f"sa_svd_adapter_r{script_args.lora_r}_{model_name_clean}"
         adapter_path = os.path.join(base_output_dir, adapter_name)
 
         full_precision_residual_path = os.path.join(script_args.output_dir, f"{model_name_clean}_residual_base_r{script_args.lora_r}_fp16")

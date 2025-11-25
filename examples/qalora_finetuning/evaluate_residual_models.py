@@ -20,8 +20,8 @@ def parse_residual_model_info(model_path: str) -> Dict[str, Any]:
     """Extract rank, bits, and group_size from residual model path"""
     path_name = os.path.basename(model_path)
     
-    # Pattern 1: w_res_HuggingFaceTB_SmolLM2-1.7B_r256_daniel_4bit_gs32 (quantized residual)
-    pattern = r'w_res_(.+)_r(\d+)_daniel_(\d+)bit_gs(\d+)'
+    # Pattern 1: w_res_HuggingFaceTB_SmolLM2-1.7B_r256_sa_svd_4bit_gs32 (quantized residual)
+    pattern = r'w_res_(.+)_r(\d+)_sa_svd_(\d+)bit_gs(\d+)'
     match = re.match(pattern, path_name)
     
     if match:
@@ -49,7 +49,7 @@ def parse_residual_model_info(model_path: str) -> Dict[str, Any]:
         }
     
     # Skip standalone adapters - they are only used as components
-    adapter_pattern = r'daniel_adapter_r(\d+)_(.+)'
+    adapter_pattern = r'sa_svd_adapter_r(\d+)_(.+)'
     match = re.match(adapter_pattern, path_name)
     
     if match:
@@ -98,7 +98,7 @@ def find_corresponding_adapter(base_model_path: str, base_dir: str) -> str:
     """Find the corresponding adapter for a quantized base model"""
     base_name = os.path.basename(base_model_path)
     
-    # Extract rank from base model name: w_res_HuggingFaceTB_SmolLM2-1.7B_r256_daniel_4bit_gs32
+    # Extract rank from base model name: w_res_HuggingFaceTB_SmolLM2-1.7B_r256_sa_svd_4bit_gs32
     match = re.search(r'_r(\d+)_', base_name)
     if not match:
         return None
@@ -106,14 +106,14 @@ def find_corresponding_adapter(base_model_path: str, base_dir: str) -> str:
     rank = match.group(1)
     
     # Extract model name part: HuggingFaceTB_SmolLM2-1.7B
-    model_match = re.search(r'w_res_(.+)_r\d+_daniel', base_name)
+    model_match = re.search(r'w_res_(.+)_r\d+_sa_svd', base_name)
     if not model_match:
         return None
     
     model_part = model_match.group(1)
     
-    # Look for corresponding adapter: daniel_adapter_r256_HuggingFaceTB_SmolLM2-1.7B
-    adapter_name = f"daniel_adapter_r{rank}_{model_part}"
+    # Look for corresponding adapter: sa_svd_adapter_r256_HuggingFaceTB_SmolLM2-1.7B
+    adapter_name = f"sa_svd_adapter_r{rank}_{model_part}"
     adapter_path = os.path.join(base_dir, adapter_name)
     
     if os.path.exists(adapter_path):
@@ -136,9 +136,9 @@ def find_corresponding_adapter_for_fp16(base_model_path: str, base_dir: str) -> 
     # Look in parent directory for adapters with same rank
     parent_dir = os.path.dirname(base_model_path)
     
-    # Pattern: daniel_adapter_r256_*
+    # Pattern: sa_svd_adapter_r256_*
     for item in os.listdir(parent_dir):
-        adapter_pattern = f"daniel_adapter_r{rank}_"
+        adapter_pattern = f"sa_svd_adapter_r{rank}_"
         if item.startswith(adapter_pattern) and os.path.isdir(os.path.join(parent_dir, item)):
             adapter_path = os.path.join(parent_dir, item)
             return adapter_path
