@@ -10,9 +10,9 @@ set -e
 # CONFIGURATION
 # ============================================================================
 MODEL_NAMES=(
-    # "HuggingFaceTB/SmolLM2-1.7B"
-    "TinyLlama/TinyLlama_v1.1"
-    "microsoft/phi-1_5"
+    "HuggingFaceTB/SmolLM2-1.7B"
+    # "TinyLlama/TinyLlama_v1.1"
+    # "microsoft/phi-1_5"
 )
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -37,11 +37,11 @@ QALORA_GROUP_SIZES=(16 32)
 
 # --- Training Configuration ---
 DATA_PATH="yahma/alpaca-cleaned"
-DATASET_SPLIT="train[:30000]"
-DATASET_VAL_SPLIT="train[30000:32000]"
+DATASET_SPLIT="train[:10000]"
+DATASET_VAL_SPLIT="train[30000:31000]"
 NUM_TRAIN_EPOCHS=1
-PER_DEVICE_TRAIN_BATCH_SIZE=2
-GRADIENT_ACCUMULATION_STEPS=3
+PER_DEVICE_TRAIN_BATCH_SIZE=4
+GRADIENT_ACCUMULATION_STEPS=4
 LEARNING_RATE=1e-4
 MAX_LENGTH=2048
 WARMUP_RATIO=0.03
@@ -135,7 +135,7 @@ main() {
                                     --logging_steps="$LOGGING_STEPS" \
                                     --save_steps="$SAVE_STEPS" \
                                     --model_max_length="$MAX_LENGTH" \
-                                    --eval_steps=500 \
+                                    --eval_steps=100 \
                                     --report_to="wandb" 
 
                                 if [ $? -ne 0 ]; then
